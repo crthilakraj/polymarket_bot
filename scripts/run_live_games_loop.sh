@@ -11,6 +11,7 @@ cd "$(dirname "$0")/.."
 
 REFRESH_SECONDS="${REFRESH_SECONDS:-900}"
 TARGET_COUNT="${TARGET_COUNT:-10}"
+NICHE_COUNT="${NICHE_COUNT:-5}"
 LOG_DIR="${LOG_DIR:-/tmp/live_games_loop}"
 mkdir -p "$LOG_DIR"
 
@@ -18,7 +19,7 @@ cycle=0
 while true; do
   cycle=$((cycle + 1))
   echo "[$(date -u +%FT%TZ)] cycle $cycle: refreshing live game markets"
-  uv run python scripts/refresh_live_games.py --target-count "$TARGET_COUNT" --max-refreshes 1 \
+  uv run python scripts/refresh_live_games.py --target-count "$TARGET_COUNT" --niche-count "$NICHE_COUNT" --max-refreshes 1 \
     >> "$LOG_DIR/refresh.log" 2>&1
 
   echo "[$(date -u +%FT%TZ)] cycle $cycle: starting main.py for ${REFRESH_SECONDS}s"

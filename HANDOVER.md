@@ -135,6 +135,16 @@ Run `uv run pytest -q` any time — should show `280 passed`.
 4. Ran continuously for ~22h unattended before the pruning incident — didn't crash from the strategy itself, kept generating real (if bursty/episodic) profit, accumulating to $45-98 realized depending on exact check timing/window.
 5. Caught and fixed a real reporting bug ($359.56 fake number) before it was reported as real.
 
+## Niche/low-volume market pool (added this session, exploratory/unvalidated)
+
+Research review of state-of-the-art prediction-market strategies (see below) found: (a) classic same-market YES/NO arb is now dominated by sub-100ms bots (IMDEA study, $40M extracted from Polymarket Apr'24-Apr'25, 73% to sub-100ms bots); (b) an academic study of 173 Polymarket NBA games (arXiv 2605.00864) found combinatorial arb across *correlated* markets (moneyline/spread/total) produces ~40x more opportunities than single-market arb, concentrated in final minutes of live play — this matches the market category the validated edge already trades, but isn't built yet (would need new cross-market-correlation signal logic); (c) low-volume/niche markets reportedly keep persistent gaps longer since fewer bots compete them away.
+
+Acted on (c), the cheapest test: `scripts/refresh_live_games.py` now also tracks a second pool via `fetch_niche_markets()` — active, order-book-enabled markets with 24h volume in [200, 20000] (below the sports pool's 50k floor), excluding anything matching the sports "vs."/"Winner" pattern. Controlled by `--niche-count` (orchestrator: `NICHE_COUNT` env var, default 5 in `run_live_games_loop.sh`). Uses the exact same validated `ComplementaryOutcomesSignal` — only market *selection* changed, no new strategy code. **Not yet validated** — this is a live experiment, not a proven edge like the sports pool. `market_metadata.category` is always NULL from the current Gamma client mapping, so there's no clean way yet to separate niche-pool P&L from sports-pool P&L in the aggregate report — treat `report_cumulative_arb_pnl.py`'s number as combined until/unless that's built.
+
+Also checked (this session): `MarketMakingStrategy` has been running live in dry-run this whole time (unconditionally in `main.py`'s `build_strategies()`) but was never measured on sports markets — only ruled out on political/Fed markets. Added `scripts/report_market_making_pnl.py` to check it; first read: 2 fills, $0 realized, ~-$1.5 to -$1.83 unrealized over 4-24h — inconclusive, tiny sample, not obviously an edge.
+
+Restarted the orchestrator this session to pick up `--niche-count`; PID changed (old 983796 → new one, check `pgrep -af run_live_games_loop.sh`).
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet?** Check `closed` count (command above). This is still the single most important unanswered question — once markets resolve, we can confirm capital genuinely recycles as designed.
