@@ -25,6 +25,13 @@ CREATE TABLE IF NOT EXISTS order_book_snapshots (
 );
 CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_token_received
     ON order_book_snapshots (token_id, received_at);
+-- Separate from the composite index above: that one can't be used for a
+-- bare "WHERE received_at < ?" predicate (received_at isn't its leftmost
+-- column), which scripts/checkpoint_and_prune.py needs for pruning old
+-- snapshots - without this, that DELETE is a full table scan on a
+-- multi-GB table.
+CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_received_at
+    ON order_book_snapshots (received_at);
 
 CREATE TABLE IF NOT EXISTS market_metadata (
     condition_id TEXT PRIMARY KEY,

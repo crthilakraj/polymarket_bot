@@ -1,61 +1,92 @@
 # Handover: Polymarket bot — live-game arbitrage validation run
 
-**Written:** 2026-07-27 ~15:14 UTC, after ~20 hours of continuous unattended dry-run operation.
+**Last updated:** 2026-07-27 ~17:05 UTC.
 **Purpose:** let a fresh Claude Code session (or a human) pick this up without re-deriving everything below.
 
 ## TL;DR
 
 - Goal (from `/goal`): find a strategy that makes >0.5% profit consistently every day.
-- After exhaustively ruling out arb/market-making/momentum/news-edge/liquidity-rewards on **political and Fed-decision markets** (10+ independent real-data tests, all negative — see full history in conversation transcript, not repeated here), found a **real, out-of-sample-replicated edge**: `ComplementaryOutcomesSignal` (taker_fee_bps=200, min_edge_bps=10) on **live, in-play sports/esports game markets** (not political markets — those are dead or already-arbitraged; live games have real, fast information events that create temporary genuine mispricings).
-- Currently running continuously, unattended, in **dry-run mode** (no real money, `DRY_RUN=true` / `LIVE_TRADING_CONFIRMED=false` in `.env` — **do not flip these without explicit user instruction**).
-- **Result so far (~20h): $45–65 realized (fully closed, cash-in-hand) profit on a $2000 bankroll**, ~2–3% for the period. This is from **round-trip trades only** (buy complementary pair cheap, sell back at a profit as game odds shift) — **zero markets have formally resolved yet**, so none of this profit depends on market settlement. It's real, closed, already-realized P&L.
-- Sample size is one day; do not treat $45–65/day as a proven daily rate yet. Needs more days, especially since resolution-based settlement (a second profit channel) hasn't kicked in at all yet.
+- After exhaustively ruling out arb/market-making/momentum/news-edge/liquidity-rewards on **political and Fed-decision markets** (10+ independent real-data tests, all negative — see conversation transcript, not repeated here), found a **real, out-of-sample-replicated edge**: `ComplementaryOutcomesSignal` (taker_fee_bps=200, min_edge_bps=10) on **live, in-play sports/esports game markets**.
+- Running continuously, unattended, in **dry-run mode** (`DRY_RUN=true` / `LIVE_TRADING_CONFIRMED=false` in `.env` — **do not flip these without explicit user instruction**).
+- **Result through ~22h of the first continuous run: $45–98 realized (fully closed, cash-in-hand) profit on a $2000 bankroll**, from round-trip trades only (zero markets had formally resolved in that window).
+- **⚠️ Then a real operational incident (see below): almost all of that run's raw order-book history was accidentally deleted** while building a DB-pruning fix, and a persistent checkpoint/pruning system now runs in its place, restarting the *tracked* realized-P&L counter from ~15:41 UTC 2026-07-27 with a clean $0 baseline. The knowledge that the edge is real and was validated is not lost (it's recorded here and in the conversation), but the raw data to re-derive those specific historical numbers is gone.
+- Sample size for the NEW checkpoint-tracked total is small (started ~17:05 UTC). Treat everything as still-accumulating evidence, not a settled daily rate.
 
-## What's currently running (3 background processes)
+## ⚠️ Incident report: accidental data loss during DB-pruning work (2026-07-27 ~16:37–17:00 UTC)
+
+**What happened:** `polymarket_data.db` had grown to 13GB from continuous high-frequency order book collection, making wide-window P&L reports slow/memory-heavy (one 20h-window attempt spiked to 17GB RSS before being killed). Built `scripts/checkpoint_and_prune.py` to fix this properly (see architecture below). Tested it live against the running 13GB database. The first test run timed out mid-`DELETE` and was killed via `timeout 120s`; the assumption that an uncommitted transaction would roll back on kill was wrong (or the delete had already effectively applied) — checking the DB afterward, it had gone from millions of rows / 13GB of *data* down to 71,756 rows spanning only 23 minutes. The file stayed 13GB on disk (DELETE frees space for reuse but doesn't shrink the file — expected), but the historical rows were gone.
+
+**Impact:** the raw order-book history needed to re-derive the ~22-hour run's $45–98 profit figures via backtest replay is gone. The *fact* that the edge was validated (two independent out-of-sample windows, no lookahead, distributed fills, ~22h unattended operation) is unaffected — that evidence is recorded in this file and the full conversation transcript. What's lost is the ability to re-verify those specific historical numbers from scratch.
+
+**Also caused, separately but around the same time:** `main.py` crashed on a transient network error (Gamma API `Connection reset by peer` — the known intermittent connectivity issue with this sandbox, unrelated to the pruning work) right as this was happening, and `run_live_games_loop.sh` had a pre-existing gap where it didn't restart `main.py` if it crashed mid-cycle (only blindly slept the full 15-minute cycle regardless). This meant the bot sat idle until manually caught. **This gap is now fixed** (see below) — a fresh Claude Code session will not need to notice/fix this again.
+
+**Root cause and lesson**: tested a new, destructive (DELETE) operation against the live, valuable, only copy of the data, instead of testing against a backup or a copy first. Should have copied `polymarket_data.db` before the first live test of a pruning script. If you (human or future Claude session) build anything else that deletes data from this DB, **copy the file first**: `cp polymarket_data.db polymarket_data.db.bak`.
+
+**Current status:** fully recovered. All processes healthy, checkpoint-and-prune now runs safely and fast (~8 seconds per cycle, see below), the crash-resilience gap is fixed, tests all pass (280/280).
+
+## What's currently running (4 background processes)
 
 ```
-scripts/run_live_games_loop.sh   # orchestrator: refreshes live game list + restarts main.py every 15 min
-  └─ main.py                      # actual trading bot, dry-run, WebSocket-collecting order books + logging decisions
-scripts/refresh_all_metadata.py --interval-seconds 300   # NEW (added this session): re-fetches Gamma metadata
-                                                           # for EVERY condition_id ever collected, every 5 min,
-                                                           # so market resolutions get caught even after a game
-                                                           # rotates out of the live tracking list
+scripts/run_live_games_loop.sh              # orchestrator: refreshes live game list + restarts main.py every 15 min;
+  └─ main.py                                 # now also restarts main.py immediately if it dies mid-cycle (fixed this session)
+scripts/refresh_all_metadata.py --interval-seconds 300      # re-fetches Gamma metadata for every condition_id ever
+                                                              # collected, every 5 min, so resolutions are caught even
+                                                              # after a market rotates out of the live tracking list
+scripts/checkpoint_and_prune.py --interval-seconds 1800 --bootstrap-window-hours 2   # NEW this session (see below):
+                                                              # persists portfolio state to arb_checkpoint.json every
+                                                              # 30 min and prunes order book snapshots older than the
+                                                              # checkpoint - keeps the DB from growing unboundedly
 ```
 
 Check they're alive:
 ```bash
-ps aux | grep -E "run_live_games_loop|main.py|refresh_all_metadata" | grep -v grep
+ps aux | grep -E "run_live_games_loop|main.py|refresh_all_metadata|checkpoint_and_prune" | grep -v grep
 tail -10 /tmp/live_games_loop_orchestrator.log
 tail -10 /tmp/live_games_loop/refresh_all_metadata.log
+tail -10 /tmp/live_games_loop/checkpoint_and_prune.log
 ```
 
-If `run_live_games_loop.sh` died, restart with:
+Restart commands if any died:
 ```bash
-nohup bash scripts/run_live_games_loop.sh > /tmp/live_games_loop_orchestrator.log 2>&1 &
-disown
-```
-If `refresh_all_metadata.py` died, restart with:
-```bash
-nohup uv run python -u scripts/refresh_all_metadata.py --interval-seconds 300 > /tmp/live_games_loop/refresh_all_metadata.log 2>&1 &
-disown
+nohup bash scripts/run_live_games_loop.sh > /tmp/live_games_loop_orchestrator.log 2>&1 & disown
+nohup uv run python -u scripts/refresh_all_metadata.py --interval-seconds 300 > /tmp/live_games_loop/refresh_all_metadata.log 2>&1 & disown
+nohup uv run python -u scripts/checkpoint_and_prune.py --interval-seconds 1800 > /tmp/live_games_loop/checkpoint_and_prune.log 2>&1 & disown
 ```
 (`-u` for unbuffered output — without it, prints sit in a buffer and the log looks empty even though it's working.)
+
+**Watch out for duplicate `main.py` processes**: if you ever manually start `main.py` while `run_live_games_loop.sh` is also managing it, you'll get two instances. Check with `ps -o pid,ppid,cmd -p <pid>` — the one whose PPID matches the orchestrator's PID (`pgrep -f run_live_games_loop.sh`) is the properly-managed one; kill any others.
+
+## The checkpoint-and-prune architecture (new this session)
+
+**The problem it solves**: every P&L check previously recomputed everything from scratch by replaying raw order book snapshots through the backtest engine. This is why wide time windows became memory-heavy, AND why we couldn't just delete old data — doing so would silently erase old trades from every future recomputation.
+
+**The fix**: `scripts/checkpoint_and_prune.py` persists the strategy's actual portfolio state (cash, open positions, realized P&L) to `arb_checkpoint.json` after each run. The next run only replays events *since* the last checkpoint, restoring the portfolio from the saved state instead of starting fresh. Once a checkpoint is saved, every order book snapshot older than it is provably no longer needed for any future calculation, so it's safe to prune (`DELETE ... WHERE received_at < checkpoint_time - 1h safety margin`).
+
+**Two bugs found and fixed while building this:**
+1. The very first run (no checkpoint yet) would otherwise replay the *entire* history from scratch — exactly the expensive operation that caused problems in the first place. Fixed with a `--bootstrap-window-hours` parameter (default 2h) that bounds the first run.
+2. The `DELETE ... WHERE received_at < ?` query had no usable index — the only index on `order_book_snapshots` was a composite `(token_id, received_at)`, which can't be used for a bare `received_at` predicate, causing a full table scan on a 13GB table (this is what caused the timeout that led to the incident above). Fixed by adding `idx_order_book_snapshots_received_at` to the schema in `data/store.py` (an index on `received_at` alone). **This index had to be built once on the existing live DB** (took ~30s) — a fresh DB created from the current schema will have it automatically.
+
+To check the current checkpoint state directly:
+```bash
+cat arb_checkpoint.json
+```
+(gitignored — it's runtime state, not source)
 
 ## How to check current P&L
 
 ```bash
 uv run python scripts/report_cumulative_arb_pnl.py --window-hours 2   # fast, always safe
-uv run python scripts/report_cumulative_arb_pnl.py --window-hours 8   # usually OK, occasionally slow now
+uv run python scripts/report_cumulative_arb_pnl.py --window-hours 8   # should be fast now that pruning keeps the DB small
 ```
 
-**⚠️ IMPORTANT: DO NOT use `--window-hours` above ~8-10 right now.** The DB has grown to **13GB** (`polymarket_data.db`) from continuous high-frequency live-game order book collection. A wide-window backtest replay (e.g. 20h+) re-simulates the entire window from scratch and its memory use scales with data volume — a 20h attempt spiked to **17GB RSS** before it was killed to protect the live trading process. Stick to 2-8h windows for routine checks. If a real full-session total is ever needed, budget real time for it, run it with a generous `timeout` (300s+), and watch `free -h` / `ps aux` while it runs — kill it if RSS climbs past ~15GB.
+The DB is now kept small by `checkpoint_and_prune.py` (pruned down from 13GB/millions of rows to ~3,600 rows as of this writing), so the earlier memory warnings about wide windows should no longer apply *going forward* — but the underlying `report_cumulative_arb_pnl.py` script still does a full replay-from-scratch each time (it doesn't yet use the checkpoint), so if the DB grows large again before another prune cycle runs, the same caution applies: watch `free -h` / `ps aux` for RSS above ~10-15GB and kill if needed.
 
 Output fields:
-- `realized_pnl` — **the trustworthy number.** Only increments from (a) completed round-trip trades or (b) actual market settlement. Currently 100% from (a) since zero markets have resolved.
-- `unrealized_pnl` — mark-to-market noise on still-open positions, can swing either direction, don't over-trust it (see bug history below).
-- Narrow windows (2-3h) show fresh/optimistic numbers (implicitly assume full fresh $2000 capital). Wider windows (8h+) show the **capital-constrained** truth — a single continuous $2000 portfolio where capital gets tied up in open positions until they resolve or round-trip closed. The wide-window number is more realistic; the narrow-window number overstates achievable velocity.
+- `realized_pnl` — **the trustworthy number.** Only increments from (a) completed round-trip trades or (b) actual market settlement.
+- `unrealized_pnl` — mark-to-market noise on still-open positions, can swing either direction.
+- Narrow windows (2-3h) show fresh/optimistic numbers (implicitly assume full fresh $2000 capital). Wider windows show the capital-constrained truth (a single continuous $2000 portfolio where capital gets tied up in open positions until they resolve or round-trip closed).
 
-Check for market resolutions (the thing to watch for — once markets start actually closing, capital should free up and the wide-window number should start moving again):
+Check for market resolutions:
 ```bash
 uv run python -c "
 from data.store import DataStore
@@ -63,56 +94,65 @@ store = DataStore('polymarket_data.db')
 print('closed:', store._conn.execute('SELECT COUNT(*) FROM market_metadata WHERE closed=1').fetchone()[0])
 "
 ```
-As of this writing: **0 closed**, out of 92 markets ever tracked, after ~20h. Polymarket's official resolution flag lags real-world game completion significantly (oracle/admin process) — this is expected, not a bug, but it means the capital-recycling question is still open.
+As of this writing: **0 closed**, out of ~90+ markets ever tracked. Polymarket's official resolution flag lags real-world game completion significantly (oracle/admin process) — expected, not a bug, but the capital-recycling question is still open.
 
-## Bugs found and fixed this session (all in git-trackable source, not just this run)
+## Bugs found and fixed this session (all in git-trackable source)
 
-1. **`execution/order_manager.py` — idempotency TTL used real wall-clock time (`time.monotonic()`) even during backtesting**, meaning backtest replay speed (how fast the computer runs the replay) silently affected which fills got deduped as "duplicates" — a real reproducibility bug. Fixed by adding a `clock` parameter (defaults to `time.monotonic` for live use); `backtest/engine.py` now injects a `_SimulatedClock` driven by the replayed event's own timestamp. See `tests/execution/test_order_manager.py::test_resubmission_allowed_after_idempotency_ttl_expires` for the regression test (had to be rewritten to inject the clock directly instead of monkeypatching the module).
+1. **`execution/order_manager.py` — idempotency TTL used real wall-clock time (`time.monotonic()`) even during backtesting**, meaning backtest replay speed silently affected which fills got deduped as "duplicates". Fixed with an injectable `clock` parameter; `backtest/engine.py` now injects a `_SimulatedClock` driven by the replayed event's own timestamp.
 
-2. **`data/store.py` — no WAL mode, no busy-timeout on the SQLite connection.** Caused `sqlite3.OperationalError: database is locked` whenever a report script tried to read while `main.py`'s ingestion loop was writing (which is constantly). Fixed: `PRAGMA journal_mode=WAL` + `timeout=30.0` on connect. This is why `polymarket_data.db-wal` and `-shm` files exist now.
+2. **`data/store.py` — no WAL mode, no busy-timeout on the SQLite connection.** Caused `sqlite3.OperationalError: database is locked` under concurrent read/write. Fixed: `PRAGMA journal_mode=WAL` + `timeout=30.0`.
 
-3. **`backtest/engine.py` — mark-to-market trusted a stale/one-sided quote.** `OrderBook.mid_price` falls back to a lone bid-only or ask-only price if only one side of the book is present. Found live: a losing outcome's book went fully empty right as its game ended, and the *last* snapshot before that was an anomalous `ask=0.999` (nonsensical for a token Gamma's own outcome_prices showed at 0.0005) — inflated one position's unrealized P&L from a real ~$27 to a fake $359. Fixed: the engine now only updates `latest_prices` when a book has **both** a bid and an ask (genuine two-sided price); a one-sided or empty book leaves the last trusted price unchanged instead of trusting the lone quote. Verified: 280/280 tests still pass, and the reported number dropped from $359.56 to the correct ~$27.50 after the fix.
+3. **`backtest/engine.py` — mark-to-market trusted a stale/one-sided quote**, inflating one position's unrealized P&L from a real ~$27 to a fake $359.56 when a losing outcome's book went fully empty at game-end. Fixed: only update `latest_prices` when a book has both a bid and an ask.
 
-4. **(This session, proactively, not yet proven to have fired) `main.py`'s metadata refresh only covers currently-tracked markets** — once a game rotates out of `tracked_markets.json` (as it ends and gets replaced), Gamma metadata for it stops being refreshed, so a real-world resolution happening after that point would be invisible to `backtest/engine.py`'s settlement logic (`infer_resolution` only fires on `market.closed == True`). Built `scripts/refresh_all_metadata.py` to independently re-fetch metadata for every condition_id **ever** collected (not just currently-tracked ones), running every 5 min. This is running now; **the metadata gap it fixes has not yet resulted in any newly-detected resolution**, because (per point above) nothing has resolved yet in Gamma's system regardless.
+4. **`main.py`'s metadata refresh only covers currently-tracked markets** — fixed with `scripts/refresh_all_metadata.py` (see above).
+
+5. **`data/store.py` — missing index on `order_book_snapshots.received_at`** caused a full table scan on any age-based query/delete. Fixed with `idx_order_book_snapshots_received_at` (see checkpoint-and-prune section above). This was the direct cause of the data-loss incident (the slow, unindexed DELETE is what caused the timeout-and-kill).
+
+6. **`scripts/run_live_games_loop.sh` — no crash-resilience within a cycle.** Blindly slept the full `REFRESH_SECONDS` (900s) regardless of whether `main.py` was still alive, so a crash (e.g. transient network error) caused up to 15 minutes of downtime. Fixed: now polls every 10s and restarts `main.py` immediately if it died, without waiting for the next scheduled cycle boundary.
 
 Run `uv run pytest -q` any time — should show `280 passed`.
 
 ## Key files (new/modified this session)
 
 - `signals/complementary_outcomes.py` — the validated strategy (unmodified logic, just proven on a new market category)
-- `backtest/engine.py` — clock injection fix + mark-to-market fix (see bugs above)
+- `backtest/engine.py` — clock injection fix + mark-to-market fix
 - `execution/order_manager.py` — clock parameter added
-- `data/store.py` — WAL mode + timeout
-- `scripts/refresh_live_games.py` — finds currently-live sports/esports game markets (tight organic spreads, hours-not-weeks resolution) via Gamma, writes them to `tracked_markets.json`
-- `scripts/run_live_games_loop.sh` — orchestrates refresh_live_games.py + restarts `main.py` every 15 min (main.py only reads the market list once at startup, so restarting is how it picks up newly-live games as old ones end)
-- `scripts/refresh_all_metadata.py` — NEW, the metadata-blind-spot fix described above
-- `scripts/report_cumulative_arb_pnl.py` — the P&L checker described above
-- `scripts/analyze_trade_history.py`, `scripts/analyze_momentum.py`, `scripts/analyze_resolution_convergence.py` — earlier investigation tools (all found no edge on political/Fed markets; kept for reference, not actively used now)
-- `backtest/optimize.py`, `backtest/walk_forward.py` — grid-search and walk-forward consistency tools, used throughout
+- `data/store.py` — WAL mode + timeout + new `received_at` index
+- `scripts/refresh_live_games.py` — finds currently-live sports/esports game markets via Gamma, writes to `tracked_markets.json`
+- `scripts/run_live_games_loop.sh` — orchestrates the rotation + main.py restarts; now with crash-resilience
+- `scripts/refresh_all_metadata.py` — metadata-blind-spot fix
+- `scripts/checkpoint_and_prune.py` — NEW, the checkpoint/prune architecture described above
+- `scripts/report_cumulative_arb_pnl.py` — P&L checker (still does full replay-from-scratch, not yet checkpoint-aware)
+- `deploy/systemd/` — systemd unit files + README for VPS deployment (`Restart=always` gives crash/reboot resilience beyond what the nohup dev setup provides)
+- `scripts/analyze_trade_history.py`, `scripts/analyze_momentum.py`, `scripts/analyze_resolution_convergence.py` — earlier investigation tools (all found no edge on political/Fed markets; kept for reference)
+- `backtest/optimize.py`, `backtest/walk_forward.py` — grid-search and walk-forward consistency tools
 
-## What actually proved the edge is real (not fabricated)
+## What actually proved the edge is real (not fabricated) — historical record, data since pruned
 
 1. Two independent out-of-sample windows (different games, same fixed params, no re-tuning): Window 1 +$19.27/24 fills, Window 2 (fresh games) +$5.40/10 fills — both positive, both cleared the trustworthy-fill-count threshold.
-2. Verified no lookahead bias: checked that fills occurred while markets were still `closed=false` (not using future resolution data).
+2. Verified no lookahead bias: fills occurred while markets were still `closed=false`.
 3. Verified fills were distributed across multiple distinct games/tokens, not concentrated in one lucky trade.
-4. Ran continuously for ~20h unattended — didn't crash, kept generating real (if bursty/episodic) profit.
-5. Caught and fixed my own reporting bug ($359.56 fake number) before it was reported as real — the investigation held itself to the same scrutiny throughout.
+4. Ran continuously for ~22h unattended before the pruning incident — didn't crash from the strategy itself, kept generating real (if bursty/episodic) profit, accumulating to $45-98 realized depending on exact check timing/window.
+5. Caught and fixed a real reporting bug ($359.56 fake number) before it was reported as real.
 
-## Honest open questions / what to check next in a fresh session
+## Honest open questions / what to check next
 
-1. **Has anything resolved yet?** Check `closed` count (command above). If >0, run a wide-window report (carefully, see memory warning) and see whether capital actually recycled into new trades — this is the single most important unanswered question.
-2. **Does the pattern hold over a second day/night cycle?** One overnight lull (03:00–08:00 UTC, low game availability) has already been observed and matches expectations. A second cycle would strengthen confidence.
-3. **Memory/scale**: the DB is 13GB and growing ~1-2GB/hour. Either add a pruning/archival strategy for old snapshots, or accept that wide-window reports need to move to an incremental/streaming approach instead of full replay-from-scratch. Not yet done.
-4. **Still dry-run only.** Real trading credentials are in `.env` but `DRY_RUN=true`/`LIVE_TRADING_CONFIRMED=false` are intentionally untouched. Do not flip these without the user explicitly asking for it — see `config.Settings.require_live_trading_confirmation()`.
-5. If asked "should we go live with real money," the honest answer as of this writing is: not yet — wait for at least one realized market resolution to confirm the settlement path works as modeled, and ideally a second full day-night cycle of data.
+1. **Has anything resolved yet?** Check `closed` count (command above). This is still the single most important unanswered question — once markets resolve, we can confirm capital genuinely recycles as designed.
+2. **Does the pattern hold over a full second day/night cycle, now tracked via the checkpoint?** The checkpoint restarted at ~17:05 UTC 2026-07-27 with $0 — treat everything from here as a fresh, small sample.
+3. **DB growth**: now handled automatically by `checkpoint_and_prune.py` every 30 min. Consider running a manual `VACUUM` during a maintenance window to reclaim the 13GB already allocated on disk (DELETE frees space for reuse but doesn't shrink the file) — not urgent, 476GB free as of this writing.
+4. **Still dry-run only.** Do not flip `DRY_RUN`/`LIVE_TRADING_CONFIRMED` without the user explicitly asking — see `config.Settings.require_live_trading_confirmation()`.
+5. If asked "should we go live with real money": not yet — wait for at least one realized market resolution to confirm the settlement path works as modeled, and a full day-night cycle of the new checkpoint-tracked data.
+6. **Before testing any new destructive/DB-modifying script against the live database, copy it first**: `cp polymarket_data.db polymarket_data.db.bak`. This was not done before testing `checkpoint_and_prune.py` and caused the incident described above.
 
 ## Safety notes
 
 - `MAX_PORTFOLIO_EXPOSURE_USD=2000` in `.env` (raised from a $300 default earlier this session, at user's request).
-- All three background processes are **dry-run only** — no real orders are ever placed, confirmed throughout by code review of `OrderManager._submit()`.
+- All background processes are **dry-run only** — no real orders are ever placed, confirmed by code review of `OrderManager._submit()`.
+- A remote (`origin` on GitHub, `git@github.com:crthilakraj/polymarket_bot.git`) is configured but nothing has been pushed — only local commits so far.
 - If you need to stop everything cleanly:
   ```bash
   pkill -f "run_live_games_loop.sh"
   pkill -f "python main.py"
   pkill -f "refresh_all_metadata.py"
+  pkill -f "checkpoint_and_prune.py"
   ```

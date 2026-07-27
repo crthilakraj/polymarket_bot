@@ -25,7 +25,22 @@ while true; do
   uv run python main.py > "$LOG_DIR/main_${cycle}.log" 2>&1 &
   main_pid=$!
 
-  sleep "$REFRESH_SECONDS"
+  # Poll instead of blindly sleeping the full cycle: if main.py dies early
+  # (e.g. a transient network error at startup - has happened live), restart
+  # it immediately against the same market list instead of leaving the bot
+  # down for up to REFRESH_SECONDS until the next scheduled cycle.
+  elapsed=0
+  restart_count=0
+  while [ "$elapsed" -lt "$REFRESH_SECONDS" ]; do
+    sleep 10
+    elapsed=$((elapsed + 10))
+    if ! kill -0 "$main_pid" 2>/dev/null; then
+      restart_count=$((restart_count + 1))
+      echo "[$(date -u +%FT%TZ)] cycle $cycle: main.py died early (elapsed ${elapsed}s) - restarting (restart #${restart_count})"
+      uv run python main.py > "$LOG_DIR/main_${cycle}_restart${restart_count}.log" 2>&1 &
+      main_pid=$!
+    fi
+  done
 
   kill "$main_pid" 2>/dev/null
   wait "$main_pid" 2>/dev/null

@@ -23,4 +23,5 @@ htmlcov/
 *.db-wal
 *.sqlite3
 tracked_markets.json
+arb_checkpoint.json
 
