@@ -1,0 +1,11 @@
+Backtest report: complementary_outcomes
+================================================
+Initial cash:        $1,000.00
+Final equity:        $1,000.00
+Total P&L:           $0.00 (+0.00%)
+  Realized:          $0.00
+  Unrealized:        $0.00
+Fills:               0
+Sharpe (per-tick):   0.000
+Max drawdown:        0.00%
+Brier score / log loss: n/a (no resolved-market predictions to grade)
