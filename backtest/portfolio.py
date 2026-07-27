@@ -46,28 +46,42 @@ class Portfolio:
         size: float,
         timestamp: datetime,
         strategy: str,
+        fee_rate: float = 0.0,
     ) -> None:
+        """fee_rate is a fraction of this fill's notional (e.g. 0.02 = 2%,
+        matching ComplementaryOutcomesSignal.taker_fee_rate) - folded into an
+        effective price so it hits both cash (immediately) and avg_cost /
+        realized_pnl (an opening fee raises cost basis and so reduces
+        unrealized_pnl until recovered; a closing fee reduces realized_pnl
+        directly), rather than being tracked as a separate side-channel that
+        the rest of the accounting would need to remember to consult."""
         if size <= 0:
             raise ValueError(f"fill size must be positive, got {size}")
+
+        fee_per_share = price * fee_rate
+        # A fee is a cost regardless of side: buying pays more than the
+        # quoted price effectively, selling receives less.
+        effective_price = price + fee_per_share if side is Side.BUY else price - fee_per_share
 
         position = self.positions.setdefault(token_id, Position(token_id, condition_id))
         signed_size = size if side is Side.BUY else -size
         self.cash -= price * signed_size
+        self.cash -= fee_per_share * size
 
         extending = position.shares == 0 or (position.shares > 0) == (signed_size > 0)
         if extending:
             new_shares = position.shares + signed_size
-            total_cost = position.avg_cost * position.shares + price * signed_size
+            total_cost = position.avg_cost * position.shares + effective_price * signed_size
             position.avg_cost = total_cost / new_shares if new_shares != 0 else 0.0
             position.shares = new_shares
         else:
             closing_size = min(abs(signed_size), abs(position.shares))
             direction = 1 if position.shares > 0 else -1
-            self.realized_pnl += (price - position.avg_cost) * closing_size * direction
+            self.realized_pnl += (effective_price - position.avg_cost) * closing_size * direction
             remaining = abs(signed_size) - closing_size
             position.shares += signed_size
             if remaining > 0:
-                position.avg_cost = price  # flipped through zero - fresh position at this price
+                position.avg_cost = effective_price  # flipped through zero - fresh position here
             elif position.shares == 0:
                 position.avg_cost = 0.0
 

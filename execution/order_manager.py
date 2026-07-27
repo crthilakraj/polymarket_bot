@@ -178,6 +178,17 @@ class OrderManager:
             return [OrderDecision(status=OrderStatus.REJECTED, intent=None, reasons=result.reasons)]
 
         num_complete_sets = result.approved_size_usd / basket_cost_per_set
+        max_shares = signal.metadata.get("max_shares")
+        if max_shares is not None and max_shares < num_complete_sets:
+            num_complete_sets = max_shares
+        if num_complete_sets <= 0:
+            return [
+                OrderDecision(
+                    status=OrderStatus.REJECTED,
+                    intent=None,
+                    reasons=["no size available at quoted price (book depth exhausted)"],
+                )
+            ]
         return [
             self._submit(
                 condition_id=condition_id,

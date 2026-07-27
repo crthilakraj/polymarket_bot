@@ -229,6 +229,13 @@ def _process_signal_strategy(
     else:
         decisions = [order_manager.handle_signal(signal, market, book)]
 
+    # Strategies that price in a taker fee when deciding whether to trade
+    # (e.g. ComplementaryOutcomesSignal.taker_fee_rate) should have that same
+    # fee actually deducted from the portfolio, not just used as a firing
+    # threshold - otherwise reported P&L is gross, not net, of the exact fee
+    # the signal itself required to clear before it fired.
+    fee_rate = getattr(strategy, "taker_fee_rate", 0.0)
+
     for decision in decisions:
         if decision.status not in (OrderStatus.SUBMITTED, OrderStatus.DRY_RUN) or decision.intent is None:
             continue
@@ -241,6 +248,7 @@ def _process_signal_strategy(
             size=intent.size,
             timestamp=book.received_at,
             strategy=name,
+            fee_rate=fee_rate,
         )
         if signal.token_id is not None:
             # Multi-leg (arb) signals don't have a single fair-value price to

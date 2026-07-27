@@ -47,7 +47,9 @@ class ComplementaryOutcomesSignal(SignalStrategy):
             return None  # missing a book for at least one outcome - can't sum safely
 
         best_asks: dict[str, float] = {}
+        best_ask_sizes: dict[str, float] = {}
         best_bids: dict[str, float] = {}
+        best_bid_sizes: dict[str, float] = {}
         for token_id in market.token_ids:
             book = order_books[token_id]
             best_ask = book.best_ask
@@ -55,22 +57,31 @@ class ComplementaryOutcomesSignal(SignalStrategy):
             if best_ask is None or best_bid is None:
                 return None  # one-sided or empty book - can't price this leg
             best_asks[token_id] = best_ask.price
+            best_ask_sizes[token_id] = best_ask.size
             best_bids[token_id] = best_bid.price
+            best_bid_sizes[token_id] = best_bid.size
 
-        buy_signal = self._check_buy_complete_set(market, best_asks)
+        buy_signal = self._check_buy_complete_set(market, best_asks, best_ask_sizes)
         if buy_signal is not None:
             return buy_signal
 
-        return self._check_sell_complete_set(market, best_bids)
+        return self._check_sell_complete_set(market, best_bids, best_bid_sizes)
 
     def _check_buy_complete_set(
-        self, market: MarketMetadata, best_asks: dict[str, float]
+        self, market: MarketMetadata, best_asks: dict[str, float], best_ask_sizes: dict[str, float]
     ) -> Signal | None:
         sum_ask = sum(best_asks.values())
         fee_cost = sum(price * self.taker_fee_rate for price in best_asks.values())
         edge = 1.0 - sum_ask - fee_cost
         if edge <= self.min_edge_rate:
             return None
+        # The quoted price only holds for the size actually resting at the
+        # top of book - sizing past that on any single leg would walk the
+        # book to worse prices and could erase the edge this signal just
+        # computed. Cap at the thinnest leg's available size; OrderManager
+        # additionally caps by risk limits, so the final size is whichever
+        # is smaller.
+        max_shares = min(best_ask_sizes.values())
         return Signal(
             edge_estimate=edge,
             confidence=self._confidence(edge),
@@ -80,6 +91,7 @@ class ComplementaryOutcomesSignal(SignalStrategy):
                 "condition_id": market.condition_id,
                 "sum_probability": sum_ask,
                 "fee_cost": fee_cost,
+                "max_shares": max_shares,
                 "legs": [
                     {"token_id": token_id, "side": Side.BUY, "price": price}
                     for token_id, price in best_asks.items()
@@ -88,13 +100,14 @@ class ComplementaryOutcomesSignal(SignalStrategy):
         )
 
     def _check_sell_complete_set(
-        self, market: MarketMetadata, best_bids: dict[str, float]
+        self, market: MarketMetadata, best_bids: dict[str, float], best_bid_sizes: dict[str, float]
     ) -> Signal | None:
         sum_bid = sum(best_bids.values())
         fee_cost = sum(price * self.taker_fee_rate for price in best_bids.values())
         edge = sum_bid - 1.0 - fee_cost
         if edge <= self.min_edge_rate:
             return None
+        max_shares = min(best_bid_sizes.values())
         return Signal(
             edge_estimate=edge,
             confidence=self._confidence(edge),
@@ -104,6 +117,7 @@ class ComplementaryOutcomesSignal(SignalStrategy):
                 "condition_id": market.condition_id,
                 "sum_probability": sum_bid,
                 "fee_cost": fee_cost,
+                "max_shares": max_shares,
                 "legs": [
                     {"token_id": token_id, "side": Side.SELL, "price": price}
                     for token_id, price in best_bids.items()
