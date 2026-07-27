@@ -33,6 +33,11 @@ def main() -> None:
         default=8.0,
         help="Only replay the last N hours - unbounded replay gets slower/heavier every check as the DB grows",
     )
+    parser.add_argument(
+        "--show-fills",
+        action="store_true",
+        help="print each individual fill (side, price, size, market, timestamp)",
+    )
     args = parser.parse_args()
     start = datetime.now(timezone.utc) - timedelta(hours=args.window_hours)
 
@@ -74,12 +79,36 @@ def main() -> None:
         fill_timestamps = sorted(f.timestamp for f in result.fills)
         active_span_hours = (fill_timestamps[-1] - fill_timestamps[0]).total_seconds() / 3600
         print(f"active span (first fill to last fill): {active_span_hours:.2f}h")
-        if active_span_hours > 0:
+        # Below ~1 minute, dividing by active_span_hours produces a nonsense
+        # extrapolated rate (e.g. $155M/day off a handful of fills that all
+        # landed in the same second) - only show the rate once the span is
+        # wide enough to mean anything.
+        if active_span_hours > (1 / 60):
             print(
                 f"rate over active span (realized): ${result.realized_pnl / active_span_hours:.2f}/hour, "
                 f"extrapolated ${result.realized_pnl / active_span_hours * 24:.2f}/day (naive linear - "
                 f"assumes this fill rate sustains 24/7, which live game availability does not guarantee)"
             )
+        else:
+            print("active span too short to extrapolate a meaningful rate")
+
+        if args.show_fills:
+            print("\nfills:")
+            store = DataStore(settings.db_path)
+            try:
+                questions = {}
+                for f in result.fills:
+                    if f.condition_id and f.condition_id not in questions:
+                        meta = store.get_market_metadata(f.condition_id)
+                        questions[f.condition_id] = meta.question if meta else f.condition_id
+            finally:
+                store.close()
+            for f in sorted(result.fills, key=lambda f: f.timestamp):
+                question = questions.get(f.condition_id, f.condition_id or f.token_id)
+                print(
+                    f"  {f.timestamp.isoformat()}  {f.side.value:4s}  "
+                    f"{f.size:8.4f} shares @ ${f.price:.4f}  [{f.strategy}]  {question}"
+                )
     else:
         print("no fills yet")
 
