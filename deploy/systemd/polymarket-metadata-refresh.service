@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket bot - metadata refresher (detects market resolutions for every condition_id ever collected, every 5min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=polymarket
+WorkingDirectory=/opt/polymarket-bot
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/usr/bin/env uv run python -u scripts/refresh_all_metadata.py --interval-seconds 300
+Restart=always
+RestartSec=10
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

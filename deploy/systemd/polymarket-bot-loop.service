@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket bot - live-game rotation loop (refreshes tracked markets + restarts main.py every 15min)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User/WorkingDirectory to match your deployment - a dedicated,
+# non-root user is strongly recommended given this process holds trading
+# credentials (via .env) even in dry-run mode.
+User=polymarket
+WorkingDirectory=/opt/polymarket-bot
+EnvironmentFile=/opt/polymarket-bot/.env
+ExecStart=/bin/bash /opt/polymarket-bot/scripts/run_live_games_loop.sh
+Restart=always
+RestartSec=10
+# The loop script itself manages main.py as a child process (starts/kills it
+# every REFRESH_SECONDS) - stopping this unit cleanly stops both.
+KillMode=control-group
+TimeoutStopSec=30
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
