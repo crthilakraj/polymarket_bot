@@ -145,6 +145,17 @@ Also checked (this session): `MarketMakingStrategy` has been running live in dry
 
 Restarted the orchestrator this session to pick up `--niche-count`; PID changed (old 983796 → new one, check `pgrep -af run_live_games_loop.sh`).
 
+## Fee accounting and book-depth sizing fixes (2026-07-27 ~21:00 UTC)
+
+User asked whether fees were being considered in P&L, and whether trade size considered available book depth. Neither was true until this fix:
+
+1. **Fees were never deducted anywhere.** `ComplementaryOutcomesSignal` required edge to clear an estimated 2% taker fee before firing, but that fee was only ever used as a *threshold gate* — `Portfolio.apply_fill` moved cash at the raw fill price with no fee subtracted. All P&L numbers reported before this fix (including the $5.83/$45-98 figures) were **gross, not net, of fees**. Fixed: `apply_fill` now takes `fee_rate`, folded into an effective price so it hits cash immediately and cost-basis/realized_pnl on close; `backtest/engine.py` threads `strategy.taker_fee_rate` through.
+2. **Order sizing ignored book depth.** `handle_multi_leg_signal` sized arb baskets purely from the risk cap (`max_order_usd / basket_cost`), never checking how many shares were actually resting at the quoted best bid/ask. Fixed: `ComplementaryOutcomesSignal` now reports `max_shares` (thinnest leg's available size) in signal metadata; `OrderManager` caps the basket to it.
+
+Confirmed both are live: `report_cumulative_arb_pnl.py --show-fills` now shows trade sizes capped to real book depth (5-19 shares instead of 100+) and correspondingly smaller, more honest realized_pnl. **Restarted all 3 background processes** (`run_live_games_loop.sh`, `checkpoint_and_prune.py`) to pick up the fix — `refresh_all_metadata.py` untouched (doesn't do portfolio accounting). PIDs changed again, check `pgrep -af run_live_games_loop.sh` / `pgrep -af checkpoint_and_prune.py`.
+
+**Implication**: every P&L figure quoted anywhere before this timestamp (including HANDOVER's historical $45-98 record and this session's $5.83/$6.00 checkpoint reads) was optimistic — real fees and real depth constraints were not applied. Treat this as the point the numbers became trustworthy, not before.
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet?** Check `closed` count (command above). This is still the single most important unanswered question — once markets resolve, we can confirm capital genuinely recycles as designed.
