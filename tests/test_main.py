@@ -45,8 +45,18 @@ def make_book(token_id="yes", bid=0.44, ask=0.46) -> OrderBook:
 def test_build_strategies_returns_the_expected_defaults():
     strategies = main_module.build_strategies()
 
-    assert set(strategies) == {"complementary_outcomes", "market_making"}
+    assert set(strategies) == {"complementary_outcomes"}
     assert isinstance(strategies["complementary_outcomes"], ComplementaryOutcomesSignal)
+
+
+def test_build_strategies_includes_market_making_when_enabled(monkeypatch):
+    monkeypatch.setattr(
+        main_module, "settings", dataclasses.replace(real_settings, enable_market_making=True)
+    )
+
+    strategies = main_module.build_strategies()
+
+    assert set(strategies) == {"complementary_outcomes", "market_making"}
     assert isinstance(strategies["market_making"], MarketMakingStrategy)
 
 

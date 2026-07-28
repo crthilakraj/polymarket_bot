@@ -45,11 +45,24 @@ def build_strategies() -> dict[str, SignalStrategy | MarketMakingStrategy]:
     included here: NewsEdgeSignal only fires when a headline is attached via
     SignalContext.metadata["headline"], and this pipeline has no live
     headline feed wired in - the same documented limitation as
-    backtest/engine.py. Wire one up and add it to this dict if you need it live."""
-    return {
+    backtest/engine.py. Wire one up and add it to this dict if you need it live.
+
+    market_making is off by default (ENABLE_MARKET_MAKING=true to turn it
+    back on): a live dry-run check found no proven edge (P&L inconclusive/
+    slightly negative on a small sample - see scripts/report_market_making_pnl.py),
+    while it was responsible for 9.5M of 9.55M rows (99.5%) in decisions_log
+    over one ~48h run - almost entirely rejected orders once the portfolio's
+    exposure cap filled up - which is what made scripts/cli.py's journal
+    replay time out and need bounding. Not worth the operational cost without
+    a demonstrated edge."""
+    strategies: dict[str, SignalStrategy | MarketMakingStrategy] = {
         "complementary_outcomes": ComplementaryOutcomesSignal(),
-        "market_making": MarketMakingStrategy(position_limits=PositionLimits.from_settings(settings)),
     }
+    if settings.enable_market_making:
+        strategies["market_making"] = MarketMakingStrategy(
+            position_limits=PositionLimits.from_settings(settings)
+        )
+    return strategies
 
 
 def build_order_manager() -> OrderManager:

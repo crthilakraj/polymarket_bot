@@ -77,6 +77,7 @@ class Settings:
     log_level: str
     dry_run: bool
     live_trading_confirmed: bool
+    enable_market_making: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -114,6 +115,8 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             dry_run=os.getenv("DRY_RUN", "true").lower() in ("1", "true", "yes"),
             live_trading_confirmed=os.getenv("LIVE_TRADING_CONFIRMED", "false").lower()
+            in ("1", "true", "yes"),
+            enable_market_making=os.getenv("ENABLE_MARKET_MAKING", "false").lower()
             in ("1", "true", "yes"),
         )
 
