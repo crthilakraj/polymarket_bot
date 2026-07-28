@@ -172,6 +172,10 @@ Also fixed this session: the arb basket's exposure-cap sizing didn't reserve roo
 - **Found and fixed a second, deeper negative-cash bug (2026-07-28 ~14:51 UTC):** the earlier sizing fix (reserve fee room when sizing a single trade) wasn't enough - cash got *worse*, not better, after it (-$3.31 -> -$33.38), because `OrderManager._record_exposure` (called from `_submit`) still recorded raw `price*size` with no fee, so the exposure ledger never reflected cumulative fees paid across the session, letting real cash drift further from the tracked "committed capital" every trade. Fixed at the root: `_submit` now takes `fee_rate` and books `price*size*(1+fee_rate)`; `handle_multi_leg_signal` recovers the rate from its own sizing calc and passes it per leg. Restarted all 3 processes again to pick this up.
 - No lever exists to speed up Polymarket's own resolution process - that bottleneck is structural, not something this codebase can fix.
 
+## Market selection widened (2026-07-28 ~16:00 UTC)
+
+Found live: standalone `Spread: Team (-1.5)` markets (e.g. `Spread: Cincinnati Reds (-1.5)`, 27k 24h volume) don't contain "vs"/"Winner" and exceed the niche pool's $20k ceiling - invisible to both pools despite being legitimate, tradeable live-game markets. Added `Spread:`/`Moneyline:`/`Total:` to the sports-pool matching keywords (shared via `_is_game_market()` in `scripts/refresh_live_games.py`, also used by the niche pool's exclusion check so the two pools still don't double-count). Also bumped default pool sizes (`target_count` 10->15, `niche_count` 5->8) now that `MAX_PORTFOLIO_EXPOSURE_USD` is $4000 instead of $2000. Restarted the orchestrator (not `checkpoint_and_prune.py`, which doesn't touch market selection).
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet?** Check `closed` count (command above). This is still the single most important unanswered question — once markets resolve, we can confirm capital genuinely recycles as designed.
