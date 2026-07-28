@@ -176,6 +176,14 @@ Also fixed this session: the arb basket's exposure-cap sizing didn't reserve roo
 
 Found live: standalone `Spread: Team (-1.5)` markets (e.g. `Spread: Cincinnati Reds (-1.5)`, 27k 24h volume) don't contain "vs"/"Winner" and exceed the niche pool's $20k ceiling - invisible to both pools despite being legitimate, tradeable live-game markets. Added `Spread:`/`Moneyline:`/`Total:` to the sports-pool matching keywords (shared via `_is_game_market()` in `scripts/refresh_live_games.py`, also used by the niche pool's exclusion check so the two pools still don't double-count). Also bumped default pool sizes (`target_count` 10->15, `niche_count` 5->8) now that `MAX_PORTFOLIO_EXPOSURE_USD` is $4000 instead of $2000. Restarted the orchestrator (not `checkpoint_and_prune.py`, which doesn't touch market selection).
 
+## Real root cause of the negative-cash saga (2026-07-28 ~16:35 UTC)
+
+Cash kept getting worse (-$3.31 -> -$33.38 -> -$92.76) even after the fee-exposure-ledger fix earlier. Turned out the fee fix was correct but wasn't the (whole) problem: `scripts/checkpoint_and_prune.py` hardcoded `DEFAULT_INITIAL_CASH=2000`, completely independent of `settings.max_portfolio_exposure_usd`. When that cap was raised to $4000 (this session, ~14:35 UTC), the risk gate started approving up to $4000 of committed notional while the simulated portfolio only ever had $2000 backing it - negative cash was mathematically guaranteed past $2000 committed, with or without the fee bug. Same class of issue existed independently in `report_cumulative_arb_pnl.py`/`report_market_making_pnl.py` (never passed `initial_cash` to `run_backtest()`, silently defaulted to `backtest/engine.py`'s $1000) and `scripts/cli.py`'s `--initial-cash` default (hardcoded $1000).
+
+**Fixed**: all four now use `settings.max_portfolio_exposure_usd` as the single source of truth, so this can't silently desync again if the cap changes. Also did a one-time +$2000 correction to `arb_checkpoint.json`'s cash to match today's cap increase (cash: -92.76 -> 1907.24; realized_pnl/positions untouched). Restarted `checkpoint_and_prune.py` to pick this up.
+
+**Lesson**: when changing a config value that other scripts assume/hardcode independently, grep for every place that value (or an equivalent hardcoded default) is used before declaring the change complete.
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet?** Check `closed` count (command above). This is still the single most important unanswered question — once markets resolve, we can confirm capital genuinely recycles as designed.
