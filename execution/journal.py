@@ -191,9 +191,31 @@ class DecisionJournal:
     def all_decisions(self) -> list[DecisionRecord]:
         """Every decision ever logged, oldest first - what the CLI replays
         through a fresh backtest.portfolio.Portfolio to compute current
-        (simulated) positions and P&L."""
+        (simulated) positions and P&L.
+
+        Unbounded - decisions_log has no pruning (unlike
+        data.store.DataStore's order_book_snapshots), so this can become a
+        very slow full-table scan once the bot has run a while (hit 9.5M
+        rows/multi-minute query in real operation, mostly rejected
+        market_making quotes logged on every book tick). Prefer
+        decisions_since() for interactive use."""
         with self._lock:
             rows = self._conn.execute("SELECT * FROM decisions_log ORDER BY timestamp ASC").fetchall()
+        return [_row_to_decision(row) for row in rows]
+
+    def decisions_since(self, start: datetime) -> list[DecisionRecord]:
+        """Same as all_decisions() but bounded to timestamp >= start, using
+        idx_decisions_log_timestamp - the practical way to query once
+        decisions_log has grown large. Correctness caveat: a position opened
+        before `start` and still open won't have its cost basis included, so
+        this can misstate P&L for positions that have been open longer than
+        the window - fine for game markets (resolve in hours) but not a
+        substitute for all_decisions() if you need a fully correct replay."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM decisions_log WHERE timestamp >= ? ORDER BY timestamp ASC",
+                (start.isoformat(),),
+            ).fetchall()
         return [_row_to_decision(row) for row in rows]
 
     def close(self) -> None:
