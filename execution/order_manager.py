@@ -195,6 +195,15 @@ class OrderManager:
                     reasons=["no size available at quoted price (book depth exhausted)"],
                 )
             ]
+        # Recovers the fee rate from the two per-set costs above, so exposure
+        # booked for this basket (see _submit) matches the true cash cost
+        # (notional + fee) - not just recording it once at sizing time. The
+        # sizing fix above alone wasn't enough: it kept any ONE trade from
+        # overshooting its own budget, but exposure bookkeeping still only
+        # ever recorded raw notional, so cumulative unrecorded fees across
+        # many trades let cash drift further negative over a session (found
+        # live: -$3.31 became -$33.38 after the sizing-only fix).
+        fee_rate = (effective_cost_per_set / basket_cost_per_set) - 1.0
         return [
             self._submit(
                 condition_id=condition_id,
@@ -204,6 +213,7 @@ class OrderManager:
                 size=num_complete_sets,
                 strategy="signal_multi_leg",
                 reasons=result.reasons,
+                fee_rate=fee_rate,
             )
             for leg in legs
         ]
@@ -276,6 +286,7 @@ class OrderManager:
         size: float,
         strategy: str,
         reasons: Iterable[str] = (),
+        fee_rate: float = 0.0,
     ) -> OrderDecision:
         """Idempotency check, then submit (or log, in dry-run mode) and book
         exposure. Assumes sizing/risk-approval already happened - callers are
@@ -305,7 +316,7 @@ class OrderManager:
                 reasons=["duplicate of a recently-submitted intent"],
             )
 
-        notional_usd = price * size
+        notional_usd = price * size * (1.0 + fee_rate)
 
         if self._dry_run:
             logger.info(
