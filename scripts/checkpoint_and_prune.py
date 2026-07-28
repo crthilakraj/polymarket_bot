@@ -56,7 +56,6 @@ from execution.risk import RiskLimits  # noqa: E402
 from signals.complementary_outcomes import ComplementaryOutcomesSignal  # noqa: E402
 
 DEFAULT_CHECKPOINT_PATH = "arb_checkpoint.json"
-DEFAULT_INITIAL_CASH = 2000.0
 PRUNE_SAFETY_MARGIN_HOURS = 1.0  # keep a small buffer past the checkpoint in case of clock skew
 
 
@@ -75,7 +74,7 @@ def load_checkpoint(path: Path, bootstrap_window_hours: float) -> dict:
         bootstrap_start = datetime.now(timezone.utc) - timedelta(hours=bootstrap_window_hours)
         return {
             "checkpoint_time": bootstrap_start.isoformat(),
-            "cash": DEFAULT_INITIAL_CASH,
+            "cash": settings.max_portfolio_exposure_usd,
             "realized_pnl": 0.0,
             "positions": {},
         }
@@ -95,7 +94,7 @@ def save_checkpoint(path: Path, portfolio: Portfolio, checkpoint_time: datetime)
 
 
 def restore_portfolio(checkpoint: dict) -> Portfolio:
-    portfolio = Portfolio(initial_cash=DEFAULT_INITIAL_CASH)
+    portfolio = Portfolio(initial_cash=settings.max_portfolio_exposure_usd)
     portfolio.cash = checkpoint["cash"]
     portfolio.realized_pnl = checkpoint["realized_pnl"]
     portfolio.positions = {

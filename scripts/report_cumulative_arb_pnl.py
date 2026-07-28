@@ -60,6 +60,7 @@ def main() -> None:
         start=start,
         risk_limits=risk_limits,
         mode="isolated",
+        initial_cash=settings.max_portfolio_exposure_usd,
     )["arb"]
 
     print(

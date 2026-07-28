@@ -30,7 +30,6 @@ from data.store import DataStore
 from execution.journal import DecisionJournal
 from signals.base import Side
 
-DEFAULT_INITIAL_CASH = 1000.0
 DEFAULT_WINDOW_HOURS = 8.0
 
 FILLED_STATUSES = ("SUBMITTED", "DRY_RUN")
@@ -220,7 +219,9 @@ def cmd_pnl(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--db-path", default=settings.db_path)
-    parser.add_argument("--initial-cash", type=float, default=DEFAULT_INITIAL_CASH)
+    parser.add_argument(
+        "--initial-cash", type=float, default=settings.max_portfolio_exposure_usd
+    )
     parser.add_argument(
         "--window-hours",
         type=float,
