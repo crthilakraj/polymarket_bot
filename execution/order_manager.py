@@ -164,6 +164,12 @@ class OrderManager:
                     reasons=["basket cost per complete set is zero or negative"],
                 )
             ]
+        # fee_cost (dollars per complete set, from ComplementaryOutcomesSignal)
+        # must be included when sizing against the exposure budget, or actual
+        # cash spent (notional + fee) can exceed the approved notional once
+        # the portfolio is near-fully deployed - a real bug found live (cash
+        # went slightly negative because sizing ignored the fee entirely).
+        effective_cost_per_set = basket_cost_per_set + signal.metadata.get("fee_cost", 0.0)
 
         result = check_order(
             requested_size_usd=self._risk_limits.max_order_usd,
@@ -177,7 +183,7 @@ class OrderManager:
             )
             return [OrderDecision(status=OrderStatus.REJECTED, intent=None, reasons=result.reasons)]
 
-        num_complete_sets = result.approved_size_usd / basket_cost_per_set
+        num_complete_sets = result.approved_size_usd / effective_cost_per_set
         max_shares = signal.metadata.get("max_shares")
         if max_shares is not None and max_shares < num_complete_sets:
             num_complete_sets = max_shares
