@@ -119,10 +119,27 @@ async def main() -> None:
         token_to_market = {token_id: market for market in markets for token_id in market.token_ids}
         latest_books: dict[str, OrderBook] = {}
 
-        def on_book_update(book: OrderBook) -> None:
+        async def on_book_update(book: OrderBook) -> None:
+            # data.ws_client awaits this callback's return value if it's a
+            # coroutine (see _handle_event), so making this async and
+            # offloading the DB write via asyncio.to_thread lets the event
+            # loop keep receiving/parsing other tokens' WS frames while this
+            # write is in flight, instead of blocking the whole connection
+            # for it - measured live at ~0.4-2.6ms per write, small alone but
+            # serialized across every tracked token's ticks on one
+            # connection. Strategy evaluation and order submission stay
+            # synchronous and on this same call, unchanged: OrderManager's
+            # exposure bookkeeping (_record_exposure) has no locking and is
+            # only safe under strictly sequential execution - moving that
+            # part to a thread pool too would risk a real race condition for
+            # a code path (live order submission) that has never actually
+            # run yet (always dry_run=True so far). Not worth that risk for
+            # an inactive path; DataStore.save_order_book is already
+            # thread-safe on its own (has its own internal lock), so this
+            # part alone is safe to parallelize.
             market = token_to_market.get(book.token_id)
             book.condition_id = market.condition_id if market else book.condition_id
-            store.save_order_book(book)
+            await asyncio.to_thread(store.save_order_book, book)
             latest_books[book.token_id] = book
 
             if market is None:
