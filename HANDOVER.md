@@ -165,9 +165,10 @@ Cumulative realized_pnl reached **$116.83** on the corrected (fee/depth-aware) a
 
 Also fixed this session: the arb basket's exposure-cap sizing didn't reserve room for the taker fee, so cash could run slightly negative once the portfolio was near-fully deployed (caught live: -$3.31). Fixed in `execution/order_manager.py`'s `handle_multi_leg_signal` by including `signal.metadata["fee_cost"]` in the per-set cost used for sizing.
 
-**Real remaining optimization levers, not yet acted on** (would need explicit user sign-off since they're design tradeoffs, not bug fixes):
-- Raising `MAX_PORTFOLIO_EXPOSURE_USD` beyond $2000 (dry-run only, so safe to test) would let more capital compound at the same edge - the natural lever once capital, not opportunity, is the bottleneck. Untested how the edge behaves at higher size.
-- Lowering `min_edge_bps` would make the arb's own "sell complete set" unwind fire more readily, trading smaller per-trade profit for faster capital turnover. Would need a backtest to confirm it's net positive, not just faster.
+**Real remaining optimization levers:**
+- Attempted to backtest raising `MAX_PORTFOLIO_EXPOSURE_USD` and lowering `min_edge_bps` before changing anything live - both came back inconclusive because the retained data window (`checkpoint_and_prune.py`'s `PRUNE_SAFETY_MARGIN_HOURS=1.0` keeps only ~1-1.5h of raw order book history at any time) was too thin: zero fills at the real 200bps-fee config in a 65-minute/33-market sample. Backtesting parameter changes isn't currently viable without either widening that retention window first (costs disk, costs waiting time) or just testing live in dry-run.
+- **Decision made 2026-07-28 ~14:35 UTC: raised `MAX_PORTFOLIO_EXPOSURE_USD` from $2000 to $4000 live (dry-run, user-approved), watching real results** rather than waiting on a backtest that data thinness makes untrustworthy anyway. Restarted all 3 background processes to pick it up.
+- Lowering `min_edge_bps` (currently 10, hardcoded via `ComplementaryOutcomesSignal(taker_fee_bps=200, min_edge_bps=10)` in both `main.py`'s default construction and `report_cumulative_arb_pnl.py`) to trade smaller per-trade profit for faster capital turnover is still untested - same data-thinness problem applies. Not changed.
 - No lever exists to speed up Polymarket's own resolution process - that bottleneck is structural, not something this codebase can fix.
 
 ## Honest open questions / what to check next
