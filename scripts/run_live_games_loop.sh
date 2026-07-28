@@ -10,8 +10,8 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 REFRESH_SECONDS="${REFRESH_SECONDS:-900}"
-TARGET_COUNT="${TARGET_COUNT:-10}"
-NICHE_COUNT="${NICHE_COUNT:-5}"
+TARGET_COUNT="${TARGET_COUNT:-15}"
+NICHE_COUNT="${NICHE_COUNT:-8}"
 LOG_DIR="${LOG_DIR:-/tmp/live_games_loop}"
 mkdir -p "$LOG_DIR"
 

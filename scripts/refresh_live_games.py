@@ -44,6 +44,19 @@ MIN_HOURS_LEFT = 0.5
 MAX_HOURS_LEFT = 6.0
 MIN_VOLUME_24H = 50_000
 
+# Matching just "vs"/"Winner" missed real, tradeable per-game markets: found
+# live that standalone "Spread: Team (-1.5)" markets (e.g. "Spread:
+# Cincinnati Reds (-1.5)", 27k 24h volume) don't contain either keyword and
+# so were invisible to both this pool (wrong pattern) and the niche pool
+# (volume over its $20k ceiling) - a real coverage gap, not a data quirk.
+# These are still binary Yes/No markets (does the spread cover or not), so
+# ComplementaryOutcomesSignal applies identically once they're tracked.
+GAME_MARKET_KEYWORDS = (" vs. ", " vs ", "Winner", "Spread:", "Moneyline:", "Total:")
+
+
+def _is_game_market(question: str) -> bool:
+    return any(keyword in question for keyword in GAME_MARKET_KEYWORDS)
+
 # Niche/low-volume pool: markets with SOME real activity (order book enabled,
 # not a dead/never-traded listing) but well below the sports pool's
 # MIN_VOLUME_24H, on the theory that less-watched markets get their
@@ -74,7 +87,7 @@ def fetch_live_game_markets(client: httpx.Client, limit: int = 100) -> list[dict
     candidates = []
     for m in markets:
         question = m.get("question", "")
-        if not (" vs. " in question or " vs " in question or "Winner" in question):
+        if not _is_game_market(question):
             continue
         end = m.get("endDate")
         if not end:
@@ -134,7 +147,7 @@ def fetch_niche_markets(client: httpx.Client, max_pages: int = 10) -> list[dict]
             if not m.get("enableOrderBook"):
                 continue
             question = m.get("question", "")
-            if " vs. " in question or " vs " in question or "Winner" in question:
+            if _is_game_market(question):
                 continue
             end = m.get("endDate")
             if not end:
