@@ -1,6 +1,6 @@
 # Handover: Polymarket bot — live-game arbitrage validation run
 
-**Last updated:** 2026-07-27 ~17:05 UTC.
+**Last updated:** 2026-07-28 ~14:20 UTC.
 **Purpose:** let a fresh Claude Code session (or a human) pick this up without re-deriving everything below.
 
 ## TL;DR
@@ -155,6 +155,20 @@ User asked whether fees were being considered in P&L, and whether trade size con
 Confirmed both are live: `report_cumulative_arb_pnl.py --show-fills` now shows trade sizes capped to real book depth (5-19 shares instead of 100+) and correspondingly smaller, more honest realized_pnl. **Restarted all 3 background processes** (`run_live_games_loop.sh`, `checkpoint_and_prune.py`) to pick up the fix — `refresh_all_metadata.py` untouched (doesn't do portfolio accounting). PIDs changed again, check `pgrep -af run_live_games_loop.sh` / `pgrep -af checkpoint_and_prune.py`.
 
 **Implication**: every P&L figure quoted anywhere before this timestamp (including HANDOVER's historical $45-98 record and this session's $5.83/$6.00 checkpoint reads) was optimistic — real fees and real depth constraints were not applied. Treat this as the point the numbers became trustworthy, not before.
+
+## 48h checkpoint: optimization findings (2026-07-28 ~14:00-14:20 UTC)
+
+Cumulative realized_pnl reached **$116.83** on the corrected (fee/depth-aware) accounting before the next fixes below, from $2000 starting capital, over roughly a day of active post-fix operation. Two real findings from asking "how do we optimize":
+
+1. **Capital, not signal availability, is now the binding constraint.** By ~13:37 UTC cash had gone slightly negative (-$3.31, see the sizing-cap fix below) with **28 open positions** absorbing nearly the entire $2000. Checked all 14 distinct markets behind those positions: 10 had already finished in real life but Polymarket still showed `closed=false` up to **15+ hours** after the scheduled end time, confirming Polymarket's resolution/oracle process is a real, unpredictable bottleneck outside the bot's control. The strategy can't open new positions once capital is fully committed, regardless of how much edge is available — this is the actual throughput ceiling right now, not detection quality.
+2. **`market_making` was net-negative operational cost with no proven edge.** `scripts/report_market_making_pnl.py` showed inconclusive/slightly negative P&L (-$1.5 to -$1.83 unrealized) on a tiny sample. Separately, `decisions_log` (no pruning, unlike `order_book_snapshots`) had grown to **9.55M rows**, and a group-by showed **9,502,569 of them (99.5%) were rejected `market_making` orders** vs. only 1,240 total for the validated `complementary_outcomes` strategy. This alone was enough to make `scripts/cli.py`'s journal replay time out. **Fixed: `market_making` is now off by default** (`ENABLE_MARKET_MAKING=true` in `.env` to re-enable) - see `main.py build_strategies()`. Also deleted the 9.51M stale rejected rows from the live DB as a one-time cleanup.
+
+Also fixed this session: the arb basket's exposure-cap sizing didn't reserve room for the taker fee, so cash could run slightly negative once the portfolio was near-fully deployed (caught live: -$3.31). Fixed in `execution/order_manager.py`'s `handle_multi_leg_signal` by including `signal.metadata["fee_cost"]` in the per-set cost used for sizing.
+
+**Real remaining optimization levers, not yet acted on** (would need explicit user sign-off since they're design tradeoffs, not bug fixes):
+- Raising `MAX_PORTFOLIO_EXPOSURE_USD` beyond $2000 (dry-run only, so safe to test) would let more capital compound at the same edge - the natural lever once capital, not opportunity, is the bottleneck. Untested how the edge behaves at higher size.
+- Lowering `min_edge_bps` would make the arb's own "sell complete set" unwind fire more readily, trading smaller per-trade profit for faster capital turnover. Would need a backtest to confirm it's net positive, not just faster.
+- No lever exists to speed up Polymarket's own resolution process - that bottleneck is structural, not something this codebase can fix.
 
 ## Honest open questions / what to check next
 
