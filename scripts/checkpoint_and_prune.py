@@ -136,6 +136,34 @@ def run_once(checkpoint_path: Path, bootstrap_window_hours: float) -> None:
             )
 
         new_fills = len(portfolio.fills) - new_fills_before
+
+        # replay_events() only replays order-book price action, so a position
+        # in a market that has since resolved would otherwise sit open forever
+        # at its pre-resolution avg_cost even after the real-world market pays
+        # out - settle it here using the resolved outcome_prices (1.0/0.0 per
+        # token) from market_metadata, now that GammaClient actually surfaces
+        # closed=true markets (see HANDOVER.md).
+        condition_ids_held = {
+            pos.condition_id for pos in portfolio.positions.values() if pos.shares != 0 and pos.condition_id
+        }
+        resolutions: dict[str, float] = {}
+        settled_conditions: list[str] = []
+        for condition_id in condition_ids_held:
+            market = store.get_market_metadata(condition_id)
+            if market is None or not market.closed:
+                continue
+            for token_id, payout in zip(market.token_ids, market.outcome_prices):
+                position = portfolio.positions.get(token_id)
+                if position is not None and position.shares != 0:
+                    resolutions[token_id] = payout
+            settled_conditions.append(condition_id)
+        if resolutions:
+            portfolio.settle(resolutions)
+            print(
+                f"[{datetime.now(timezone.utc).isoformat()}] settled {len(resolutions)} position(s) "
+                f"across {len(settled_conditions)} resolved market(s): {settled_conditions}"
+            )
+
         checkpoint_time = last_event_time or datetime.now(timezone.utc)
         save_checkpoint(checkpoint_path, portfolio, checkpoint_time)
 
