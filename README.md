@@ -676,8 +676,11 @@ others, sometimes within the same session).
 `data/`, `signals/`, `execution/`, `backtest/` (including `optimize.py`),
 `main.py`, and `scripts/cli.py` are implemented and tested. Documented
 placeholders/gaps to revisit before trading live:
-- `ComplementaryOutcomesSignal`'s fee model (`taker_fee_bps`, a flat rate per
-  leg's notional) should be replaced with Polymarket's real taker fee schedule.
+- ~~`ComplementaryOutcomesSignal`'s fee model (`taker_fee_bps`, a flat rate per
+  leg's notional) should be replaced with Polymarket's real taker fee schedule.~~
+  Done: it now uses Gamma's per-market `feeSchedule` (`fee = rate * price**exponent
+  * (1-price)**exponent`) when available, falling back to the flat placeholder only
+  for markets Gamma hasn't returned a schedule for.
 - `signals/news/feed.py`'s `RssNewsFeed` is unimplemented - wire up an actual
   RSS parser or news API client before running the news signal against
   anything but `MockNewsFeed`. Neither the backtest engine nor `main.py` has
