@@ -98,6 +98,7 @@ async def main() -> None:
     store = DataStore(settings.db_path)
     journal = DecisionJournal(settings.db_path)
     gamma = GammaClient()
+    pending_writes: set[asyncio.Task] = set()
 
     try:
         markets = await asyncio.to_thread(
@@ -119,38 +120,40 @@ async def main() -> None:
         token_to_market = {token_id: market for market in markets for token_id in market.token_ids}
         latest_books: dict[str, OrderBook] = {}
 
+        def _on_write_done(task: asyncio.Task) -> None:
+            pending_writes.discard(task)
+            exc = task.exception() if not task.cancelled() else None
+            if exc is not None:
+                logger.warning("order book DB write failed (dropped, not retried): %s", exc)
+
         async def on_book_update(book: OrderBook) -> None:
-            # data.ws_client awaits this callback's return value if it's a
-            # coroutine (see _handle_event), so making this async and
-            # offloading the DB write via asyncio.to_thread lets the event
-            # loop keep receiving/parsing other tokens' WS frames while this
-            # write is in flight, instead of blocking the whole connection
-            # for it - measured live at ~0.4-2.6ms per write, small alone but
-            # serialized across every tracked token's ticks on one
-            # connection. Strategy evaluation and order submission stay
-            # synchronous and on this same call, unchanged: OrderManager's
-            # exposure bookkeeping (_record_exposure) has no locking and is
-            # only safe under strictly sequential execution - moving that
-            # part to a thread pool too would risk a real race condition for
-            # a code path (live order submission) that has never actually
-            # run yet (always dry_run=True so far). Not worth that risk for
-            # an inactive path; DataStore.save_order_book is already
-            # thread-safe on its own (has its own internal lock), so this
-            # part alone is safe to parallelize.
+            # Trade decisions run on the fresh in-memory book immediately;
+            # persisting a snapshot to disk is disposable, replay-only data
+            # (scripts/checkpoint_and_prune.py already prunes it once a
+            # checkpoint no longer needs it) and must never gate or delay a
+            # decision - especially since write contention with
+            # checkpoint_and_prune.py/refresh_all_metadata.py has twice
+            # caused real "database is locked" failures live (see
+            # HANDOVER.md). Fire-and-forget via asyncio.create_task instead
+            # of awaiting it: a lost snapshot only costs some backtest-replay
+            # fidelity, never a trading decision. DataStore.save_order_book
+            # is already thread-safe on its own (has its own internal lock).
             market = token_to_market.get(book.token_id)
             book.condition_id = market.condition_id if market else book.condition_id
-            await asyncio.to_thread(store.save_order_book, book)
             latest_books[book.token_id] = book
 
-            if market is None:
-                return
-            for name, strategy in strategies.items():
-                if isinstance(strategy, MarketMakingStrategy):
-                    _run_market_making(name, strategy, market, book, order_manager, journal)
-                else:
-                    _run_signal_strategy(
-                        name, strategy, market, book, latest_books, order_manager, journal
-                    )
+            if market is not None:
+                for name, strategy in strategies.items():
+                    if isinstance(strategy, MarketMakingStrategy):
+                        _run_market_making(name, strategy, market, book, order_manager, journal)
+                    else:
+                        _run_signal_strategy(
+                            name, strategy, market, book, latest_books, order_manager, journal
+                        )
+
+            write_task = asyncio.create_task(asyncio.to_thread(store.save_order_book, book))
+            pending_writes.add(write_task)
+            write_task.add_done_callback(_on_write_done)
 
         ws_client = ClobWebSocketClient(token_ids=list(token_to_market), on_book_update=on_book_update)
 
@@ -175,6 +178,8 @@ async def main() -> None:
         )
         await asyncio.gather(ws_client.run(), refresh_metadata_loop())
     finally:
+        if pending_writes:
+            await asyncio.gather(*pending_writes, return_exceptions=True)
         gamma.close()
         journal.close()
         store.close()
