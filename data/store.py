@@ -63,7 +63,7 @@ class DataStore:
         parent = Path(db_path).parent
         if str(parent):
             parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30.0)
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=60.0)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.Lock()
         with self._lock:

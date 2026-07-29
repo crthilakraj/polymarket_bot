@@ -70,11 +70,16 @@ def main() -> None:
     count = 0
     try:
         while True:
-            total, newly_closed = refresh_once(store, gamma)
-            print(
-                f"[{datetime.now(timezone.utc).isoformat()}] refreshed {total} markets, "
-                f"{newly_closed} newly closed this pass"
-            )
+            try:
+                total, newly_closed = refresh_once(store, gamma)
+                print(
+                    f"[{datetime.now(timezone.utc).isoformat()}] refreshed {total} markets, "
+                    f"{newly_closed} newly closed this pass"
+                )
+            except Exception as exc:  # noqa: BLE001 - a transient failure (e.g. a locked DB
+                # while checkpoint_and_prune.py holds a long write transaction) shouldn't kill
+                # this long-running loop; log and retry next cycle instead.
+                print(f"[{datetime.now(timezone.utc).isoformat()}] refresh cycle failed: {exc}")
             count += 1
             if args.max_refreshes and count >= args.max_refreshes:
                 break
