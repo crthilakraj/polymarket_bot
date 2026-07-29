@@ -55,14 +55,24 @@ def test_to_market_metadata_parses_json_encoded_fields():
 
 
 def test_get_markets_by_condition_ids_returns_parsed_markets():
-    fake_client = FakeHttpClient([FakeResponse(200, json_data=[SAMPLE_MARKET])])
+    closed_market = {**SAMPLE_MARKET, "conditionId": "0xdef", "closed": True}
+    fake_client = FakeHttpClient(
+        [
+            FakeResponse(200, json_data=[SAMPLE_MARKET]),
+            FakeResponse(200, json_data=[closed_market]),
+        ]
+    )
     client = GammaClient(base_url="https://gamma.test", client=fake_client)
 
-    markets = client.get_markets_by_condition_ids(["0xabc"])
+    markets = client.get_markets_by_condition_ids(["0xabc", "0xdef"])
 
-    assert len(markets) == 1
-    assert markets[0].condition_id == "0xabc"
-    assert fake_client.calls[0][1] == {"condition_ids": ["0xabc"]}
+    # Queries both closed=false and closed=true since Gamma silently drops
+    # already-closed markets from a condition_ids-only query - a resolved
+    # market must not be invisible to a caller polling for resolutions.
+    assert len(markets) == 2
+    assert {m.condition_id for m in markets} == {"0xabc", "0xdef"}
+    assert fake_client.calls[0][1] == {"condition_ids": ["0xabc", "0xdef"], "closed": "false"}
+    assert fake_client.calls[1][1] == {"condition_ids": ["0xabc", "0xdef"], "closed": "true"}
 
 
 def test_get_markets_by_condition_ids_empty_list_short_circuits():
@@ -76,14 +86,18 @@ def test_get_markets_by_condition_ids_empty_list_short_circuits():
 def test_retries_on_429_then_succeeds(monkeypatch):
     monkeypatch.setattr("data.gamma_client.time.sleep", lambda _: None)
     fake_client = FakeHttpClient(
-        [FakeResponse(429), FakeResponse(200, json_data=[SAMPLE_MARKET])]
+        [
+            FakeResponse(429),
+            FakeResponse(200, json_data=[SAMPLE_MARKET]),
+            FakeResponse(200, json_data=[]),
+        ]
     )
     client = GammaClient(base_url="https://gamma.test", client=fake_client)
 
     markets = client.get_markets_by_condition_ids(["0xabc"])
 
     assert len(markets) == 1
-    assert len(fake_client.calls) == 2
+    assert len(fake_client.calls) == 3
 
 
 SAMPLE_EVENT = {

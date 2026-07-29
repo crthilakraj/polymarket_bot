@@ -97,11 +97,25 @@ class GammaClient:
         raise RuntimeError(f"Gamma request to {path} failed after {MAX_RETRIES} attempts") from last_exc
 
     def get_markets_by_condition_ids(self, condition_ids: list[str]) -> list[MarketMetadata]:
-        """Fetch current metadata for the given condition_ids (order not guaranteed)."""
+        """Fetch current metadata for the given condition_ids (order not guaranteed).
+
+        Gamma's /markets endpoint defaults to closed=false when the `closed`
+        param is omitted - a condition_ids-only query silently excludes any
+        market that has since resolved, so a caller polling for resolutions
+        (e.g. scripts/refresh_all_metadata.py) would never see closed=true
+        even after checking forever. `closed` also only accepts a single
+        value, not a list, so both states have to be fetched as separate
+        requests and merged rather than in one call.
+        """
         if not condition_ids:
             return []
-        response = self._get_with_retry("/markets", params={"condition_ids": condition_ids})
-        return [_to_market_metadata(raw) for raw in response.json()]
+        markets: list[MarketMetadata] = []
+        for closed in ("false", "true"):
+            response = self._get_with_retry(
+                "/markets", params={"condition_ids": condition_ids, "closed": closed}
+            )
+            markets.extend(_to_market_metadata(raw) for raw in response.json())
+        return markets
 
     def get_active_events(
         self,
