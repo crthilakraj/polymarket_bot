@@ -214,6 +214,28 @@ def test_handle_multi_leg_signal_rejects_when_no_legs():
     assert decisions[0].status is OrderStatus.REJECTED
 
 
+def test_handle_multi_leg_signal_rejects_whole_basket_if_any_leg_is_a_duplicate():
+    """Found live: one leg's price repeated from a recent submission (idempotency
+    dedup) while the other leg's price had moved, so only the non-duplicate leg
+    went through - a real, unhedged single-leg position instead of the intended
+    complete-set basket. Submitting the first basket should mark both legs'
+    (token, side, price, size) keys as seen; an identical second basket must be
+    rejected on BOTH legs together, not partially filled."""
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=93.0, max_portfolio_exposure_usd=1000.0)
+    )
+    market = make_market()
+
+    first = manager.handle_multi_leg_signal(make_multi_leg_signal(), market)
+    assert all(d.status is OrderStatus.DRY_RUN for d in first)
+
+    second = manager.handle_multi_leg_signal(make_multi_leg_signal(), market)
+
+    assert len(second) == 2
+    assert all(d.status is OrderStatus.REJECTED for d in second)
+    assert all("duplicate" in d.reasons[0] for d in second)
+
+
 def test_multi_leg_and_single_leg_orders_share_the_same_exposure_tracker():
     manager = make_manager(
         risk_limits=RiskLimits(max_position_usd=20.0, max_order_usd=1000.0, max_portfolio_exposure_usd=1000.0)

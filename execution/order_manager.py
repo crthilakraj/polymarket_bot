@@ -204,6 +204,37 @@ class OrderManager:
         # many trades let cash drift further negative over a session (found
         # live: -$3.31 became -$33.38 after the sizing-only fix).
         fee_rate = (effective_cost_per_set / basket_cost_per_set) - 1.0
+
+        # _submit()'s idempotency check operates per order, keyed on
+        # (token_id, side, price, size, strategy). If checked independently
+        # per leg, a leg whose price happens to repeat from a recent
+        # submission gets silently deduped while its sibling leg (a
+        # different price, so not a duplicate) goes through - leaving a
+        # real, unhedged single-leg position instead of the complete-set
+        # basket this strategy depends on for its risk profile. Found live:
+        # one outcome's book didn't move between two ticks while the other
+        # did, and the basket ended up with mismatched share counts on its
+        # two legs (263.62 vs 328.30). Check every leg's key upfront and
+        # reject the WHOLE basket if any leg would be a duplicate, instead
+        # of submitting a subset of legs.
+        leg_keys = [
+            self._idempotency_key(leg["token_id"], leg["side"], leg["price"], num_complete_sets, "signal_multi_leg")
+            for leg in legs
+        ]
+        if any(self._is_duplicate(key) for key in leg_keys):
+            logger.info(
+                "rejecting entire multi-leg basket for %s: at least one leg duplicates a recently-submitted intent",
+                condition_id,
+            )
+            return [
+                OrderDecision(
+                    status=OrderStatus.REJECTED,
+                    intent=None,
+                    reasons=["duplicate leg detected in basket - rejecting entire basket to avoid unhedged exposure"],
+                )
+                for _ in legs
+            ]
+
         return [
             self._submit(
                 condition_id=condition_id,
