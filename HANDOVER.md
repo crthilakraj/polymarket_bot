@@ -11,6 +11,7 @@
 - **Result through ~22h of the first continuous run: $45–98 realized (fully closed, cash-in-hand) profit on a $2000 bankroll**, from round-trip trades only (zero markets had formally resolved in that window).
 - **⚠️ Then a real operational incident (see below): almost all of that run's raw order-book history was accidentally deleted** while building a DB-pruning fix, and a persistent checkpoint/pruning system now runs in its place, restarting the *tracked* realized-P&L counter from ~15:41 UTC 2026-07-27 with a clean $0 baseline. The knowledge that the edge is real and was validated is not lost (it's recorded here and in the conversation), but the raw data to re-derive those specific historical numbers is gone.
 - Sample size for the NEW checkpoint-tracked total is small (started ~17:05 UTC). Treat everything as still-accumulating evidence, not a settled daily rate.
+- **Update (2026-07-29): the long-standing "zero market resolutions" claim was itself a bug**, not a real finding — see the correction under "Check for market resolutions" below. Markets have been resolving all along; this codebase just couldn't see it until now (63 of 311 tracked markets confirmed closed as of the fix).
 
 ## ⚠️ Incident report: accidental data loss during DB-pruning work (2026-07-27 ~16:37–17:00 UTC)
 
@@ -94,7 +95,7 @@ store = DataStore('polymarket_data.db')
 print('closed:', store._conn.execute('SELECT COUNT(*) FROM market_metadata WHERE closed=1').fetchone()[0])
 "
 ```
-As of this writing: **0 closed**, out of ~90+ markets ever tracked. Polymarket's official resolution flag lags real-world game completion significantly (oracle/admin process) — expected, not a bug, but the capital-recycling question is still open.
+**Correction (2026-07-29, ~21:00 UTC):** the "0 closed" reading reported here and in every session before this one was **wrong, and it was our own bug, not Polymarket's oracle lag as previously assumed.** `GammaClient.get_markets_by_condition_ids()` queried `/markets` with only `condition_ids`, no `closed` param — Gamma silently defaults to `closed=false` when that's omitted, so any market that had already resolved was invisible to `scripts/refresh_all_metadata.py` no matter how long it polled. Verified directly against a known-resolved CS:GO market (Imperial vs BESTIA): the exact query this codebase used returned 0 results; adding `closed=true` explicitly returned it with `outcomePrices: ["1","0"]`. Fixed in `data/gamma_client.py` (now queries both `closed=false` and `closed=true`, merges results) — **first refresh after the fix found 63 already-resolved markets out of 311 tracked**, not 0. Re-run the check above; it should now show a nonzero count.
 
 ## Bugs found and fixed this session (all in git-trackable source)
 
@@ -186,7 +187,7 @@ Cash kept getting worse (-$3.31 -> -$33.38 -> -$92.76) even after the fee-exposu
 
 ## Honest open questions / what to check next
 
-1. **Has anything resolved yet?** Check `closed` count (command above). This is still the single most important unanswered question — once markets resolve, we can confirm capital genuinely recycles as designed.
+1. **Has anything resolved yet? Yes — 63 of 311 tracked markets, confirmed 2026-07-29 after fixing the Gamma-client bug above.** The open question now shifts from "has anything resolved" to: does `Portfolio.settle()` correctly apply those resolutions and recycle capital as designed? Not yet verified against the live checkpoint - check `arb_checkpoint.json` open positions against `market_metadata.closed=1` for overlap and confirm cash/realized_pnl move as expected once `checkpoint_and_prune.py`'s replay processes a settlement.
 2. **Does the pattern hold over a full second day/night cycle, now tracked via the checkpoint?** The checkpoint restarted at ~17:05 UTC 2026-07-27 with $0 — treat everything from here as a fresh, small sample.
 3. **DB growth**: now handled automatically by `checkpoint_and_prune.py` every 30 min. Consider running a manual `VACUUM` during a maintenance window to reclaim the 13GB already allocated on disk (DELETE frees space for reuse but doesn't shrink the file) — not urgent, 476GB free as of this writing.
 4. **Still dry-run only.** Do not flip `DRY_RUN`/`LIVE_TRADING_CONFIRMED` without the user explicitly asking — see `config.Settings.require_live_trading_confirmation()`.
