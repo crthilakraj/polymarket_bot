@@ -60,3 +60,10 @@ class MarketMetadata:
     outcome_prices: list[float]
     token_ids: list[str]
     fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # Polymarket's real taker fee: fee = rate * price**exponent * (1-price)**exponent
+    # per share, from Gamma's `feeSchedule` (see help.polymarket.com/en/articles/13364478).
+    # None when Gamma didn't report a fee schedule for this market (e.g. an
+    # older cached row fetched before this field was tracked) - callers should
+    # fall back to a flat placeholder rate in that case, not assume fee-free.
+    fee_rate: float | None = None
+    fee_exponent: float | None = None

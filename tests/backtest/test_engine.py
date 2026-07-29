@@ -122,6 +122,74 @@ def test_complementary_outcomes_backtest_fills_and_realizes_pnl_on_resolution(tm
     assert arb_result.total_pnl > 0
 
 
+def _run_arb_backtest_with_fee_schedule(tmp_path, name: str, fee_rate, fee_exponent):
+    db_path = tmp_path / f"{name}.db"
+    store = DataStore(db_path)
+    market = MarketMetadata(
+        condition_id="0xarb",
+        question_id=None,
+        question="Will X happen?",
+        description=None,
+        resolution_source=None,
+        category=None,
+        end_date=None,
+        active=True,
+        closed=True,
+        outcomes=["Yes", "No"],
+        outcome_prices=[1.0, 0.0],
+        token_ids=["yes", "no"],
+        fee_rate=fee_rate,
+        fee_exponent=fee_exponent,
+    )
+    store.save_market_metadata(market)
+    store.save_order_book(
+        OrderBook(
+            token_id="yes",
+            condition_id="0xarb",
+            bids=[PriceLevel(0.43, 100)],
+            asks=[PriceLevel(0.45, 100)],
+            exchange_timestamp=None,
+            received_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+    )
+    store.save_order_book(
+        OrderBook(
+            token_id="no",
+            condition_id="0xarb",
+            bids=[PriceLevel(0.46, 100)],
+            asks=[PriceLevel(0.48, 100)],
+            exchange_timestamp=None,
+            received_at=datetime(2026, 1, 1, 0, 0, 1, tzinfo=timezone.utc),
+        )
+    )
+    store.close()
+
+    return run_backtest(
+        # taker_fee_bps=0 fallback on both runs - any fee difference must come
+        # from the market's own fee_rate/fee_exponent, not the strategy's
+        # constructor default.
+        strategies={"arb": ComplementaryOutcomesSignal(taker_fee_bps=0, min_edge_bps=0)},
+        condition_ids=["0xarb"],
+        db_path=str(db_path),
+        risk_limits=GENEROUS_LIMITS,
+        initial_cash=1000.0,
+        mode="isolated",
+    )["arb"]
+
+
+def test_engine_deducts_the_real_per_market_fee_from_the_portfolio(tmp_path):
+    """_process_signal_strategy used to read a single flat fee_rate off the
+    strategy (getattr(strategy, "taker_fee_rate", 0.0)) and apply it to every
+    fill. ComplementaryOutcomesSignal's real fee is price-dependent per leg
+    (SignalStrategy.fee_rate_for) - confirm the engine actually calls that
+    per-decision and it measurably reduces realized_pnl versus a fee-free
+    market, not just that the signal priced it in when deciding to fire."""
+    fee_free_result = _run_arb_backtest_with_fee_schedule(tmp_path, "no_fee", None, None)
+    real_fee_result = _run_arb_backtest_with_fee_schedule(tmp_path, "with_fee", 0.05, 1.0)
+
+    assert fee_free_result.realized_pnl > real_fee_result.realized_pnl > 0
+
+
 def test_market_making_backtest_generates_a_crossing_fill(tmp_path):
     db_path = tmp_path / "test.db"
     store = DataStore(db_path)

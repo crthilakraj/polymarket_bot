@@ -5,7 +5,9 @@ from signals.base import Side, SignalContext
 from signals.complementary_outcomes import ComplementaryOutcomesSignal
 
 
-def make_market(token_ids: list[str]) -> MarketMetadata:
+def make_market(
+    token_ids: list[str], fee_rate: float | None = None, fee_exponent: float | None = None
+) -> MarketMetadata:
     return MarketMetadata(
         condition_id="0xcond",
         question_id=None,
@@ -19,6 +21,8 @@ def make_market(token_ids: list[str]) -> MarketMetadata:
         outcomes=[f"Outcome {i}" for i in range(len(token_ids))],
         outcome_prices=[],
         token_ids=token_ids,
+        fee_rate=fee_rate,
+        fee_exponent=fee_exponent,
     )
 
 
@@ -100,6 +104,52 @@ def test_deviation_that_only_covers_fees_does_not_fire():
     result = signal.evaluate(market, order_books["yes"], SignalContext(order_books=order_books))
 
     assert result is None
+
+
+def test_uses_real_per_market_fee_schedule_when_present():
+    # Polymarket's real fee = rate * price**exponent * (1-price)**exponent per
+    # share (see help.polymarket.com/en/articles/13364478) - asymmetric,
+    # unlike the flat placeholder: cheap/favorite-vs-longshot legs get very
+    # different fees. A market with fee_rate set must use this formula
+    # instead of the flat taker_fee_bps fallback, even if one is configured.
+    market = make_market(["favorite", "longshot"], fee_rate=0.05, fee_exponent=1.0)
+    order_books = {
+        "favorite": make_book("favorite", bid=0.88, ask=0.90),
+        "longshot": make_book("longshot", bid=0.08, ask=0.09),
+    }
+    signal = ComplementaryOutcomesSignal(taker_fee_bps=200, min_edge_bps=0)
+
+    result = signal.evaluate(
+        market, order_books["favorite"], SignalContext(order_books=order_books)
+    )
+
+    assert result is not None
+    expected_fee = 0.05 * 0.90 * (1 - 0.90) + 0.05 * 0.09 * (1 - 0.09)
+    expected_edge = 1.0 - (0.90 + 0.09) - expected_fee
+    assert result.metadata["fee_cost"] == pytest.approx(expected_fee)
+    assert result.edge_estimate == pytest.approx(expected_edge)
+    # Sanity check this really differs from the flat 2% placeholder - proves
+    # the real formula path, not a coincidental match.
+    flat_fee = (0.90 + 0.09) * 0.02
+    assert expected_fee != pytest.approx(flat_fee)
+
+
+def test_fee_rate_for_matches_real_fee_schedule():
+    market = make_market(["yes", "no"], fee_rate=0.05, fee_exponent=1.0)
+    signal = ComplementaryOutcomesSignal()
+
+    rate = signal.fee_rate_for(0.90, market)
+
+    assert rate == pytest.approx(0.05 * (1 - 0.90))
+
+
+def test_fee_rate_for_falls_back_to_flat_rate_without_a_fee_schedule():
+    market = make_market(["yes", "no"])  # fee_rate=None
+    signal = ComplementaryOutcomesSignal(taker_fee_bps=200)
+
+    rate = signal.fee_rate_for(0.90, market)
+
+    assert rate == pytest.approx(0.02)
 
 
 def test_missing_book_for_an_outcome_returns_none():

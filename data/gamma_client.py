@@ -42,6 +42,7 @@ def _parse_datetime(value: str | None) -> datetime | None:
 
 
 def _to_market_metadata(raw: dict) -> MarketMetadata:
+    fee_schedule = raw.get("feeSchedule") or {}
     return MarketMetadata(
         condition_id=raw["conditionId"],
         question_id=raw.get("questionID"),
@@ -55,6 +56,8 @@ def _to_market_metadata(raw: dict) -> MarketMetadata:
         outcomes=_parse_json_list(raw.get("outcomes")),
         outcome_prices=[float(p) for p in _parse_json_list(raw.get("outcomePrices"))],
         token_ids=_parse_json_list(raw.get("clobTokenIds")),
+        fee_rate=fee_schedule.get("rate"),
+        fee_exponent=fee_schedule.get("exponent"),
     )
 
 

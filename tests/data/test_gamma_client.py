@@ -52,6 +52,20 @@ def test_to_market_metadata_parses_json_encoded_fields():
     assert market.outcome_prices == [0.6, 0.4]
     assert market.token_ids == ["111", "222"]
     assert market.end_date == datetime(2026, 12, 31, tzinfo=timezone.utc)
+    assert market.fee_rate is None
+    assert market.fee_exponent is None
+
+
+def test_to_market_metadata_parses_fee_schedule():
+    market_with_fees = {
+        **SAMPLE_MARKET,
+        "feeSchedule": {"exponent": 1, "rate": 0.05, "takerOnly": True, "rebateRate": 0.15},
+    }
+
+    market = _to_market_metadata(market_with_fees)
+
+    assert market.fee_rate == 0.05
+    assert market.fee_exponent == 1
 
 
 def test_get_markets_by_condition_ids_returns_parsed_markets():

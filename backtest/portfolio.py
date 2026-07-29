@@ -49,7 +49,7 @@ class Portfolio:
         fee_rate: float = 0.0,
     ) -> None:
         """fee_rate is a fraction of this fill's notional (e.g. 0.02 = 2%,
-        matching ComplementaryOutcomesSignal.taker_fee_rate) - folded into an
+        see SignalStrategy.fee_rate_for) - folded into an
         effective price so it hits both cash (immediately) and avg_cost /
         realized_pnl (an opening fee raises cost basis and so reduces
         unrealized_pnl until recovered; a closing fee reduces realized_pnl

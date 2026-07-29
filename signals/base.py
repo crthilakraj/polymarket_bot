@@ -73,3 +73,12 @@ class SignalStrategy(ABC):
     ) -> Signal | None:
         """Return a Signal describing the edge found, or None if there's no signal."""
         raise NotImplementedError
+
+    def fee_rate_for(self, price: float, market: MarketMetadata) -> float:
+        """The taker fee rate (fraction of notional) this strategy assumes for
+        a fill at `price` - used by backtest/engine.py to actually deduct the
+        same fee from the portfolio that the strategy priced in when deciding
+        whether to fire (see ComplementaryOutcomesSignal, whose fee is
+        price-dependent, not a single flat rate - a strategy that doesn't
+        override this has no fee model and defaults to fee-free)."""
+        return 0.0

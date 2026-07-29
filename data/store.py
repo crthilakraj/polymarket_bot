@@ -46,9 +46,17 @@ CREATE TABLE IF NOT EXISTS market_metadata (
     outcomes_json TEXT NOT NULL,
     outcome_prices_json TEXT NOT NULL,
     token_ids_json TEXT NOT NULL,
-    fetched_at TEXT NOT NULL
+    fetched_at TEXT NOT NULL,
+    fee_rate REAL,
+    fee_exponent REAL
 );
 """
+
+# CREATE TABLE IF NOT EXISTS only applies to brand-new tables - an existing
+# live DB's market_metadata table predates fee_rate/fee_exponent and needs an
+# explicit ALTER to pick them up. Safe to run on every startup: guarded by
+# checking the current columns first, so it's a no-op past the first run.
+_MARKET_METADATA_MIGRATIONS = ("fee_rate", "fee_exponent")
 
 
 def _levels_to_json(levels: list[PriceLevel]) -> str:
@@ -73,6 +81,12 @@ class DataStore:
             # takes an exclusive lock for the duration of every write.
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            existing_columns = {
+                row["name"] for row in self._conn.execute("PRAGMA table_info(market_metadata)")
+            }
+            for column in _MARKET_METADATA_MIGRATIONS:
+                if column not in existing_columns:
+                    self._conn.execute(f"ALTER TABLE market_metadata ADD COLUMN {column} REAL")
             self._conn.commit()
 
     def save_order_book(self, book: OrderBook) -> None:
@@ -103,8 +117,8 @@ class DataStore:
                 INSERT INTO market_metadata
                     (condition_id, question_id, question, description, resolution_source,
                      category, end_date, active, closed, outcomes_json, outcome_prices_json,
-                     token_ids_json, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     token_ids_json, fetched_at, fee_rate, fee_exponent)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id) DO UPDATE SET
                     question_id=excluded.question_id,
                     question=excluded.question,
@@ -117,7 +131,9 @@ class DataStore:
                     outcomes_json=excluded.outcomes_json,
                     outcome_prices_json=excluded.outcome_prices_json,
                     token_ids_json=excluded.token_ids_json,
-                    fetched_at=excluded.fetched_at
+                    fetched_at=excluded.fetched_at,
+                    fee_rate=excluded.fee_rate,
+                    fee_exponent=excluded.fee_exponent
                 """,
                 (
                     market.condition_id,
@@ -133,6 +149,8 @@ class DataStore:
                     json.dumps(market.outcome_prices),
                     json.dumps(market.token_ids),
                     market.fetched_at.isoformat(),
+                    market.fee_rate,
+                    market.fee_exponent,
                 ),
             )
             self._conn.commit()
@@ -210,6 +228,8 @@ def _row_to_market_metadata(row: sqlite3.Row) -> MarketMetadata:
         outcome_prices=json.loads(row["outcome_prices_json"]),
         token_ids=json.loads(row["token_ids_json"]),
         fetched_at=datetime.fromisoformat(row["fetched_at"]),
+        fee_rate=row["fee_rate"] if "fee_rate" in row.keys() else None,
+        fee_exponent=row["fee_exponent"] if "fee_exponent" in row.keys() else None,
     )
 
 

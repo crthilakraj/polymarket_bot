@@ -230,16 +230,17 @@ def _process_signal_strategy(
         decisions = [order_manager.handle_signal(signal, market, book)]
 
     # Strategies that price in a taker fee when deciding whether to trade
-    # (e.g. ComplementaryOutcomesSignal.taker_fee_rate) should have that same
-    # fee actually deducted from the portfolio, not just used as a firing
-    # threshold - otherwise reported P&L is gross, not net, of the exact fee
-    # the signal itself required to clear before it fired.
-    fee_rate = getattr(strategy, "taker_fee_rate", 0.0)
-
+    # (see SignalStrategy.fee_rate_for) should have that same fee actually
+    # deducted from the portfolio, not just used as a firing threshold -
+    # otherwise reported P&L is gross, not net, of the exact fee the signal
+    # itself required to clear before it fired. Computed per-decision (not
+    # once for the whole signal) since ComplementaryOutcomesSignal's real fee
+    # is price-dependent - each leg can have a materially different rate.
     for decision in decisions:
         if decision.status not in (OrderStatus.SUBMITTED, OrderStatus.DRY_RUN) or decision.intent is None:
             continue
         intent = decision.intent
+        fee_rate = strategy.fee_rate_for(intent.price, market)
         portfolio.apply_fill(
             token_id=intent.token_id,
             condition_id=intent.condition_id,
