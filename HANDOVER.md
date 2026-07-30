@@ -40,23 +40,37 @@ scripts/checkpoint_and_prune.py --interval-seconds 1800 --bootstrap-window-hours
                                                               # checkpoint - keeps the DB from growing unboundedly
 ```
 
+**As of 2026-07-30, this box runs the 3 processes under systemd (not nohup)** — installed directly as the `ubuntu` user against `/home/ubuntu/polymarket_bot` (a lighter-weight variant of `deploy/systemd/`'s dedicated-user template, made because this box was already running that way and a dedicated `polymarket` user migration wasn't requested). This was done specifically so the bot survives reboots unattended — this box has rebooted unexpectedly multiple times (one leftover unattended-upgrades reboot, plus at least one manual `sudo shutdown -r now` from earlier debugging), and previously every reboot required a human to notice all 4 processes were dead and restart them by hand.
+
+Unit files live in `/etc/systemd/system/`:
+- `polymarket-bot-orchestrator.service` → `scripts/run_live_games_loop.sh` (manages `main.py` internally, same as before)
+- `polymarket-bot-refresh-metadata.service` → `scripts/refresh_all_metadata.py --interval-seconds 300`
+- `polymarket-bot-checkpoint.service` → `scripts/checkpoint_and_prune.py --interval-seconds 1800 --bootstrap-window-hours 2`
+
+All three have `Restart=always` and are `enabled` (auto-start on boot via `multi-user.target`). They are NOT copies of the files in `deploy/systemd/` in this repo — those are the production template for a dedicated `polymarket` user under `/opt/polymarket-bot` and are unchanged; this box's live `/etc/systemd/system/*.service` files exist only on the box itself, not in git.
+
 Check they're alive:
 ```bash
-ps aux | grep -E "run_live_games_loop|main.py|refresh_all_metadata|checkpoint_and_prune" | grep -v grep
-tail -10 /tmp/live_games_loop_orchestrator.log
-tail -10 /tmp/live_games_loop/refresh_all_metadata.log
-tail -10 /tmp/live_games_loop/checkpoint_and_prune.log
+sudo systemctl status polymarket-bot-orchestrator.service polymarket-bot-refresh-metadata.service polymarket-bot-checkpoint.service --no-pager
+# or just the process tree:
+pgrep -af "run_live_games_loop.sh|checkpoint_and_prune.py|main.py|refresh_all_metadata"
 ```
 
-Restart commands if any died:
+Logs are in journald now, not `/tmp/live_games_loop/*.log`:
 ```bash
-nohup bash scripts/run_live_games_loop.sh > /tmp/live_games_loop_orchestrator.log 2>&1 & disown
-nohup uv run python -u scripts/refresh_all_metadata.py --interval-seconds 300 > /tmp/live_games_loop/refresh_all_metadata.log 2>&1 & disown
-nohup uv run python -u scripts/checkpoint_and_prune.py --interval-seconds 1800 > /tmp/live_games_loop/checkpoint_and_prune.log 2>&1 & disown
+sudo journalctl -u polymarket-bot-orchestrator.service -n 50 --no-pager
+sudo journalctl -u polymarket-bot-refresh-metadata.service -n 50 --no-pager
+sudo journalctl -u polymarket-bot-checkpoint.service -n 50 --no-pager
 ```
-(`-u` for unbuffered output — without it, prints sit in a buffer and the log looks empty even though it's working.)
 
-**Watch out for duplicate `main.py` processes**: if you ever manually start `main.py` while `run_live_games_loop.sh` is also managing it, you'll get two instances. Check with `ps -o pid,ppid,cmd -p <pid>` — the one whose PPID matches the orchestrator's PID (`pgrep -f run_live_games_loop.sh`) is the properly-managed one; kill any others.
+Restart commands if any died (systemd should already do this automatically via `Restart=always`, but if the whole unit is stopped/failed):
+```bash
+sudo systemctl restart polymarket-bot-orchestrator.service
+sudo systemctl restart polymarket-bot-refresh-metadata.service
+sudo systemctl restart polymarket-bot-checkpoint.service
+```
+
+**Watch out for duplicate `main.py` processes**: if you ever manually start `main.py` outside systemd while `polymarket-bot-orchestrator.service` is also managing it, you'll get two instances. Check with `systemctl status polymarket-bot-orchestrator.service` (shows the managed process tree) — kill anything outside that cgroup.
 
 ## The checkpoint-and-prune architecture (new this session)
 
