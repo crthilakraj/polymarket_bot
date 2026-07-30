@@ -19,6 +19,7 @@ def test_settings_defaults_apply_when_env_unset(monkeypatch):
 
     assert result.max_position_usd == 100.0
     assert result.dry_run is True
+    assert result.live_max_fund_usd == 300.0
 
 
 def test_require_trading_credentials_raises_when_missing():

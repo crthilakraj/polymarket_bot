@@ -364,3 +364,137 @@ def test_live_mode_without_client_raises():
 
     with pytest.raises(RuntimeError):
         manager.handle_signal(make_signal(), make_market(), make_book())
+
+
+# --- live-funds awareness ----------------------------------------------------------
+
+
+def test_no_live_balance_fn_means_full_configured_cap_is_used():
+    # dry-run (or a live setup without live_balance_fn wired up) has no
+    # live-funds awareness at all - sizing trusts the configured cap as-is.
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=1000.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,
+    )
+
+    decision = manager.handle_signal(make_signal(edge_estimate=0.99), make_market(), make_book())
+
+    assert decision.status is OrderStatus.DRY_RUN
+    assert manager.total_exposure == pytest.approx(300.0, rel=0.01)
+
+
+def test_live_balance_below_configured_cap_shrinks_the_effective_bankroll():
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=1000.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,  # avoid needing a real client for this sizing-only check
+        live_balance_fn=lambda: 20.0,
+    )
+
+    decision = manager.handle_signal(make_signal(edge_estimate=0.99), make_market(), make_book())
+
+    assert decision.status is OrderStatus.DRY_RUN
+    # Capped to the live balance ($20), not the configured $300 ceiling.
+    assert manager.total_exposure == pytest.approx(20.0, rel=0.01)
+
+
+def test_zero_live_balance_rejects_the_order():
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=1000.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,
+        live_balance_fn=lambda: 0.0,
+    )
+
+    decision = manager.handle_signal(make_signal(edge_estimate=0.99), make_market(), make_book())
+
+    assert decision.status is OrderStatus.REJECTED
+    assert manager.total_exposure == 0.0
+
+
+def test_live_balance_is_cached_within_the_ttl():
+    calls = []
+
+    def fake_balance():
+        calls.append(1)
+        return 300.0
+
+    fake_now = [1000.0]
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=25.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,
+        live_balance_fn=fake_balance,
+        live_balance_cache_seconds=30.0,
+        clock=lambda: fake_now[0],
+    )
+
+    manager.handle_signal(make_signal(), make_market(), make_book())
+    fake_now[0] += 10.0  # still within the 30s cache window
+    manager.handle_signal(make_signal(), make_market(), make_book())
+
+    assert len(calls) == 1
+
+
+def test_live_balance_refetches_after_the_cache_ttl_expires():
+    calls = []
+
+    def fake_balance():
+        calls.append(1)
+        return 300.0
+
+    fake_now = [1000.0]
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=25.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,
+        live_balance_fn=fake_balance,
+        live_balance_cache_seconds=30.0,
+        clock=lambda: fake_now[0],
+    )
+
+    manager.handle_signal(make_signal(), make_market(), make_book())
+    fake_now[0] += 31.0
+    manager.handle_signal(make_signal(), make_market(), make_book())
+
+    assert len(calls) == 2
+
+
+def test_live_balance_fetch_failure_falls_back_to_last_known_value():
+    fake_now = [1000.0]
+    state = {"balance": 300.0, "fail": False}
+
+    def fake_balance():
+        if state["fail"]:
+            raise RuntimeError("balance API down")
+        return state["balance"]
+
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=1000.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,
+        live_balance_fn=fake_balance,
+        live_balance_cache_seconds=1.0,
+        clock=lambda: fake_now[0],
+    )
+
+    first = manager._live_balance_usd()
+    fake_now[0] += 2.0  # past the 1s cache TTL, forces a refetch attempt
+    state["fail"] = True
+    second = manager._live_balance_usd()
+
+    assert first == 300.0
+    # Still uses the last known-good balance ($300) instead of raising or
+    # silently treating the failed fetch as "no live-funds awareness".
+    assert second == 300.0
+
+
+def test_live_balance_fetch_failure_with_no_prior_success_falls_back_to_configured_cap():
+    def always_fails():
+        raise RuntimeError("balance API down")
+
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=1000.0, max_portfolio_exposure_usd=300.0),
+        dry_run=True,
+        live_balance_fn=always_fails,
+    )
+
+    decision = manager.handle_signal(make_signal(edge_estimate=0.99), make_market(), make_book())
+
+    assert decision.status is OrderStatus.DRY_RUN
+    assert manager.total_exposure == pytest.approx(300.0, rel=0.01)

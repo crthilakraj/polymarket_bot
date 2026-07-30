@@ -402,12 +402,17 @@ execution/
                       max_order_usd, then remaining per-market room, then
                       remaining portfolio room - tightest constraint wins),
                       or rejects it if no room is left. RiskLimits.from_settings()
-                      reads MAX_POSITION_USD / MAX_ORDER_USD / MAX_PORTFOLIO_EXPOSURE_USD.
+                      reads MAX_POSITION_USD / MAX_ORDER_USD / MAX_PORTFOLIO_EXPOSURE_USD
+                      (or LIVE_MAX_FUND_USD instead of the last one, via the
+                      optional portfolio_exposure_usd_override param - see
+                      main.py's build_order_manager()).
   client.py           get_client() builds and caches a Level 2 (fully
                       authenticated) py_clob_client.ClobClient from
                       config.settings (private key + API creds + signature
                       type/funder for proxy wallets). reset_client() clears
-                      the cache, mainly for tests.
+                      the cache, mainly for tests. get_collateral_balance_usd()
+                      queries the real, live USDC balance for the trading
+                      wallet - see "Live-funds awareness" below.
   orders.py           place_order() signs an order once via
                       client.create_order() and retries only the POST
                       (client.post_order()) on transient failures (network
@@ -448,6 +453,37 @@ Note: exposure tracking books notional at *submission* time (a resting limit
 order locks collateral on Polymarket, so this is a reasonable proxy for
 capital at risk) and does not currently decrease when an order is later
 cancelled - see Status below.
+
+### Live-funds awareness
+
+Two separate bankroll caps exist so paper-trading experiments can never
+influence the real-money one, or vice versa:
+
+- `MAX_PORTFOLIO_EXPOSURE_USD` - used when `DRY_RUN=true` (paper trading;
+  purely simulated, no real funds involved).
+- `LIVE_MAX_FUND_USD` - used when `DRY_RUN=false` (live trading with real
+  funds).
+
+`LIVE_MAX_FUND_USD` alone is still just a static `.env` ceiling, though. To
+actually be aware of *available* funds (not just a configured number),
+`OrderManager` optionally takes a `live_balance_fn` - in live mode, `main.py`
+wires this to `execution.client.get_collateral_balance_usd()`, which queries
+Polymarket's `/balance-allowance` endpoint for the real USDC balance of the
+trading wallet. Every risk-gate check (`_effective_risk_limits()`) then caps
+the effective portfolio exposure ceiling to `min(LIVE_MAX_FUND_USD,
+live_balance)`, with a 30s cache (keyed off the same `clock` used for
+idempotency) so this doesn't hit the balance endpoint on every single order.
+A failed balance fetch falls back to the last known-good value (logged
+loudly) rather than blocking trading outright on a transient API hiccup; if
+no fetch has ever succeeded, it falls back to trusting the configured cap
+alone. In dry-run mode `live_balance_fn` is never wired up, so paper trading
+has no live-funds awareness at all - there's no live wallet to query.
+
+This closes what was previously a real gap: before this, sizing and risk
+gating were 100% simulated/config-based even in live mode - a live order
+could be sized against `LIVE_MAX_FUND_USD` with zero awareness of whether
+the wallet actually held that much, surfacing only as a reactive "order
+rejected" from the exchange after the fact.
 
 ## Backtesting
 

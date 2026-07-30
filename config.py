@@ -58,7 +58,17 @@ class Settings:
     max_position_usd: float
     max_order_usd: float
     max_daily_loss_usd: float
+    # Bankroll cap used for sizing/exposure when DRY_RUN=true (paper trading -
+    # no real funds involved, purely a simulated ceiling).
     max_portfolio_exposure_usd: float
+    # Bankroll cap used for sizing/exposure when DRY_RUN=false (live trading
+    # with real funds). Kept separate from max_portfolio_exposure_usd so
+    # paper-trading experiments never accidentally influence the real-money
+    # cap, and vice versa. OrderManager also clamps this further against the
+    # actual live USDC balance queried from Polymarket - see
+    # execution.client.get_collateral_balance_usd - so this is a ceiling,
+    # not a guarantee that much is actually available.
+    live_max_fund_usd: float
     kelly_fraction: float
 
     # Data layer
@@ -98,6 +108,7 @@ class Settings:
             max_order_usd=float(os.getenv("MAX_ORDER_USD", "25")),
             max_daily_loss_usd=float(os.getenv("MAX_DAILY_LOSS_USD", "50")),
             max_portfolio_exposure_usd=float(os.getenv("MAX_PORTFOLIO_EXPOSURE_USD", "300")),
+            live_max_fund_usd=float(os.getenv("LIVE_MAX_FUND_USD", "300")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
             market_condition_ids=_load_tracked_market_ids(
                 os.getenv("TRACKED_MARKETS_PATH", "tracked_markets.json"),

@@ -36,6 +36,7 @@ currently decrease when an order is later cancelled - that's a documented
 gap, not an oversight (see README).
 """
 
+import dataclasses
 import hashlib
 import logging
 import time
@@ -63,6 +64,8 @@ class OrderManager:
         kelly_params: KellyParams = KellyParams(),
         idempotency_ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        live_balance_fn: Callable[[], float] | None = None,
+        live_balance_cache_seconds: float = 30.0,
     ) -> None:
         """`clock` drives the idempotency TTL window - defaults to real wall
         time for live trading. backtest.engine passes a clock tied to the
@@ -71,13 +74,25 @@ class OrderManager:
         COMPUTATION takes rather than how far apart the historical events
         actually were, silently making backtest fills/PnL depend on how fast
         the machine running the backtest happens to be - a real
-        reproducibility bug, not just an inaccuracy (see README)."""
+        reproducibility bug, not just an inaccuracy (see README).
+
+        `live_balance_fn`, if given, is called (with `_live_balance_cache_seconds`
+        caching, keyed off `clock`) to fetch the real USDC collateral balance
+        for the trading wallet - see execution.client.get_collateral_balance_usd.
+        When set, every risk-gate check further caps the portfolio exposure
+        ceiling to the live balance, so sizing can never assume more real
+        cash is available than the wallet actually holds. Left None (the
+        default, and always the case for dry-run) means exposure is capped
+        purely by the configured RiskLimits, with no live-funds awareness."""
         self._risk_limits = risk_limits
         self._client = client
         self._dry_run = dry_run
         self._kelly_params = kelly_params
         self._idempotency_ttl_seconds = idempotency_ttl_seconds
         self._clock = clock
+        self._live_balance_fn = live_balance_fn
+        self._live_balance_cache_seconds = live_balance_cache_seconds
+        self._live_balance_cache: tuple[float, float] | None = None
         self._market_exposure_usd: dict[str, float] = {}
         self._total_exposure_usd = 0.0
         self._recent_intents: dict[str, float] = {}
@@ -94,6 +109,50 @@ class OrderManager:
     def _record_exposure(self, condition_id: str, notional_usd: float) -> None:
         self._market_exposure_usd[condition_id] = self.market_exposure(condition_id) + notional_usd
         self._total_exposure_usd += notional_usd
+
+    # ---- live-funds awareness -----------------------------------------------------
+
+    def _live_balance_usd(self) -> float | None:
+        """Cached fetch of the real wallet balance. Returns None if no
+        live_balance_fn was configured (dry-run, or a live client without one
+        wired up). A fetch failure logs loudly and falls back to the last
+        known good value rather than raising - a transient balance-API
+        hiccup shouldn't halt trading entirely, but it must never be
+        silently swallowed, since that would defeat the point of this check."""
+        if self._live_balance_fn is None:
+            return None
+        now = self._clock()
+        if self._live_balance_cache is not None:
+            value, fetched_at = self._live_balance_cache
+            if now - fetched_at < self._live_balance_cache_seconds:
+                return value
+        try:
+            value = self._live_balance_fn()
+        except Exception:
+            logger.exception(
+                "failed to fetch live USDC balance - falling back to last known value (or the "
+                "configured cap alone, if no fetch has ever succeeded)"
+            )
+            return self._live_balance_cache[0] if self._live_balance_cache is not None else None
+        self._live_balance_cache = (value, now)
+        return value
+
+    def _effective_risk_limits(self) -> RiskLimits:
+        """self._risk_limits with max_portfolio_exposure_usd further capped
+        to the real live balance, if live-funds awareness is configured and
+        the wallet currently holds less than the configured ceiling. This is
+        what makes check_order() actually reject/resize orders against real
+        available funds, instead of only ever trusting a static .env cap."""
+        live_balance = self._live_balance_usd()
+        if live_balance is None or live_balance >= self._risk_limits.max_portfolio_exposure_usd:
+            return self._risk_limits
+        logger.warning(
+            "live USDC balance ($%.2f) is below the configured cap ($%.2f) - "
+            "capping portfolio exposure to the live balance",
+            live_balance,
+            self._risk_limits.max_portfolio_exposure_usd,
+        )
+        return dataclasses.replace(self._risk_limits, max_portfolio_exposure_usd=max(0.0, live_balance))
 
     # ---- signal-driven path (single-token, e.g. news) ----------------------------
 
@@ -175,7 +234,7 @@ class OrderManager:
             requested_size_usd=self._risk_limits.max_order_usd,
             current_market_exposure_usd=self.market_exposure(condition_id) if condition_id else 0.0,
             current_total_exposure_usd=self.total_exposure,
-            limits=self._risk_limits,
+            limits=self._effective_risk_limits(),
         )
         if not result.approved:
             logger.info(
@@ -284,7 +343,7 @@ class OrderManager:
             requested_size_usd=requested_usd,
             current_market_exposure_usd=self.market_exposure(condition_id) if condition_id else 0.0,
             current_total_exposure_usd=self.total_exposure,
-            limits=self._risk_limits,
+            limits=self._effective_risk_limits(),
         )
         if not result.approved:
             logger.info(

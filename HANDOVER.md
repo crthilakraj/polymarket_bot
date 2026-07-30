@@ -200,6 +200,44 @@ Cash kept getting worse (-$3.31 -> -$33.38 -> -$92.76) even after the fee-exposu
 
 **Lesson**: when changing a config value that other scripts assume/hardcode independently, grep for every place that value (or an equivalent hardcoded default) is used before declaring the change complete.
 
+## Live-funds awareness added (2026-07-30) — closes a real pre-live-trading gap
+
+Investigated whether the bot ever checks real available funds before sizing
+a live order. It didn't: `MAX_PORTFOLIO_EXPOSURE_USD` (bankroll used for
+Kelly sizing and the portfolio exposure cap) was one static `.env` number
+used identically for paper AND live trading, with zero connection to the
+actual wallet balance - `Portfolio.cash` (used for P&L reporting) is a pure
+backtest ledger never wired into the live order path, and `py-clob-client`'s
+`get_balance_allowance()` existed but was never called anywhere. A live
+order would have been sized against a config number with no idea whether
+the wallet actually held that much, surfacing only as a reactive "order
+rejected" from the exchange after the fact.
+
+Fixed:
+- **Split the bankroll cap in two**: `MAX_PORTFOLIO_EXPOSURE_USD` now only
+  applies when `DRY_RUN=true`; a new `LIVE_MAX_FUND_USD` (default 300,
+  currently in `.env` at 300 and still inert since `DRY_RUN=true`) applies
+  when `DRY_RUN=false`. Wired via `RiskLimits.from_settings(settings,
+  portfolio_exposure_usd_override=...)` in `main.py`'s `build_order_manager()`.
+- **Real live-balance check**: `execution/client.py`'s new
+  `get_collateral_balance_usd(client)` queries Polymarket's
+  `/balance-allowance` endpoint (USDC, 6-decimal base units). `OrderManager`
+  takes an optional `live_balance_fn`, wired to this only in live mode.
+  Every risk-gate check now caps the effective portfolio exposure ceiling to
+  `min(LIVE_MAX_FUND_USD, live_balance)` (30s cache, keyed off the same
+  clock used for idempotency; a failed fetch falls back to the last known
+  value rather than blocking trading, logged loudly either way). See
+  `OrderManager._effective_risk_limits()`.
+- **`RiskLimits.max_portfolio_exposure_usd` validation relaxed** from
+  "must be positive" to "must be non-negative" - a live wallet balance of
+  exactly $0 needs to be representable as a valid state (no room, order
+  rejected via the normal check_order() path), not a construction error.
+  `max_position_usd`/`max_order_usd` are unaffected, still strictly positive.
+- Still **dry-run only** (`DRY_RUN=true`) - this is inert on the currently
+  running bot, but is now in place before live trading is ever considered.
+  22 new/updated tests across `tests/execution/test_risk.py`,
+  `test_order_manager.py`, `test_client.py`, `tests/test_config.py`.
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet, and does settlement work? Yes to both, confirmed 2026-07-29.** 63 of 311 tracked markets had resolved (Gamma-client fix above). `checkpoint_and_prune.py` never called `Portfolio.settle()` though - a resolved position just sat open forever at its pre-resolution avg_cost. Fixed: it now cross-references held condition_ids against `market_metadata.closed` and settles via `outcome_prices`. First live run after the fix settled **28 positions across 14 resolved markets in one pass**: cash $2493.99 -> $3893.24, realized_pnl $85.66 -> $140.69, open positions 34 -> 8 legs. This is the strongest validation yet - the core thesis (buy a $1 guaranteed payout for less than $1) held at actual settlement, not just round-trip price action. Remaining open question: keep watching over a longer window to see this repeat, rather than trusting one large batch.

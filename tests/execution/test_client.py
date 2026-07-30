@@ -69,3 +69,27 @@ def test_reset_client_forces_reconstruction(monkeypatch):
     second = client_module.get_client()
 
     assert first is not second
+
+
+class _FakeClobClient:
+    def __init__(self, response):
+        self._response = response
+
+    def get_balance_allowance(self, params=None):
+        return self._response
+
+
+def test_get_collateral_balance_usd_converts_from_usdc_base_units():
+    # USDC has 6 decimals - the API reports the raw integer string, not dollars.
+    fake_client = _FakeClobClient({"balance": "123456789", "allowances": {}})
+
+    balance = client_module.get_collateral_balance_usd(fake_client)
+
+    assert balance == pytest.approx(123.456789)
+
+
+def test_get_collateral_balance_usd_raises_on_unexpected_response_shape():
+    fake_client = _FakeClobClient({"unexpected": "shape"})
+
+    with pytest.raises(RuntimeError):
+        client_module.get_collateral_balance_usd(fake_client)

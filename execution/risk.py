@@ -24,20 +24,37 @@ class RiskLimits:
     """Hard cap on a single order's notional."""
 
     max_portfolio_exposure_usd: float
-    """Hard cap on total notional committed across all markets."""
+    """Hard cap on total notional committed across all markets. Unlike the
+    other two limits, 0 is a valid value here (not just >0): OrderManager
+    derives a live-balance-capped RiskLimits on the fly (see
+    _effective_risk_limits), and an empty/near-empty live wallet must be
+    representable as "no room left" rather than raising - it's a real,
+    expected trading state, not a misconfiguration."""
 
     def __post_init__(self) -> None:
-        for name in ("max_position_usd", "max_order_usd", "max_portfolio_exposure_usd"):
+        for name in ("max_position_usd", "max_order_usd"):
             value = getattr(self, name)
             if value <= 0:
                 raise ValueError(f"{name} must be positive, got {value}")
+        if self.max_portfolio_exposure_usd < 0:
+            raise ValueError(
+                f"max_portfolio_exposure_usd must be non-negative, got {self.max_portfolio_exposure_usd}"
+            )
 
     @classmethod
-    def from_settings(cls, settings) -> "RiskLimits":
+    def from_settings(cls, settings, portfolio_exposure_usd_override: float | None = None) -> "RiskLimits":
+        """`portfolio_exposure_usd_override`, if given, replaces
+        settings.max_portfolio_exposure_usd (the paper-trading bankroll cap)
+        - used by main.py to swap in settings.live_max_fund_usd (the
+        separate real-money cap) when building the live OrderManager."""
         return cls(
             max_position_usd=settings.max_position_usd,
             max_order_usd=settings.max_order_usd,
-            max_portfolio_exposure_usd=settings.max_portfolio_exposure_usd,
+            max_portfolio_exposure_usd=(
+                portfolio_exposure_usd_override
+                if portfolio_exposure_usd_override is not None
+                else settings.max_portfolio_exposure_usd
+            ),
         )
 
 

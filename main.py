@@ -66,21 +66,32 @@ def build_strategies() -> dict[str, SignalStrategy | MarketMakingStrategy]:
 
 
 def build_order_manager() -> OrderManager:
-    """dry_run mode (default) needs nothing further. Live trading requires
-    both DRY_RUN=false and LIVE_TRADING_CONFIRMED=true - see config.py."""
+    """dry_run mode (default) needs nothing further and sizes against
+    MAX_PORTFOLIO_EXPOSURE_USD (the paper-trading cap). Live trading requires
+    both DRY_RUN=false and LIVE_TRADING_CONFIRMED=true (see config.py),
+    sizes against the separate LIVE_MAX_FUND_USD cap instead, and further
+    clamps that cap to the real, live USDC balance queried from Polymarket
+    on every risk check (see OrderManager._effective_risk_limits) - so a
+    live order can never be sized against funds the wallet doesn't actually
+    have, only against a static .env number."""
     settings.require_live_trading_confirmation()
 
     client = None
+    live_balance_fn = None
+    bankroll_cap = settings.max_portfolio_exposure_usd
     if not settings.dry_run:
-        from execution.client import get_client
+        from execution.client import get_client, get_collateral_balance_usd
 
         client = get_client()
+        live_balance_fn = lambda: get_collateral_balance_usd(client)  # noqa: E731
+        bankroll_cap = settings.live_max_fund_usd
         logger.warning("LIVE TRADING IS ENABLED - real orders will be placed on Polymarket")
 
     return OrderManager(
-        risk_limits=RiskLimits.from_settings(settings),
+        risk_limits=RiskLimits.from_settings(settings, portfolio_exposure_usd_override=bankroll_cap),
         client=client,
         dry_run=settings.dry_run,
+        live_balance_fn=live_balance_fn,
     )
 
 

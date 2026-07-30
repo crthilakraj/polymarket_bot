@@ -11,13 +11,24 @@ def make_limits(**overrides) -> RiskLimits:
     return RiskLimits(**defaults)
 
 
-def test_risk_limits_rejects_non_positive_values():
+def test_risk_limits_rejects_non_positive_position_and_order_caps():
     with pytest.raises(ValueError):
         RiskLimits(max_position_usd=0.0, max_order_usd=25.0, max_portfolio_exposure_usd=300.0)
     with pytest.raises(ValueError):
         RiskLimits(max_position_usd=100.0, max_order_usd=0.0, max_portfolio_exposure_usd=300.0)
+
+
+def test_risk_limits_rejects_negative_portfolio_exposure_cap():
     with pytest.raises(ValueError):
-        RiskLimits(max_position_usd=100.0, max_order_usd=25.0, max_portfolio_exposure_usd=0.0)
+        RiskLimits(max_position_usd=100.0, max_order_usd=25.0, max_portfolio_exposure_usd=-1.0)
+
+
+def test_risk_limits_allows_zero_portfolio_exposure_cap():
+    # A live wallet with $0 balance is a valid, expected state (see
+    # OrderManager._effective_risk_limits) - not a misconfiguration like the
+    # other two limits being zero would be.
+    limits = RiskLimits(max_position_usd=100.0, max_order_usd=25.0, max_portfolio_exposure_usd=0.0)
+    assert limits.max_portfolio_exposure_usd == 0.0
 
 
 @dataclass
@@ -33,6 +44,15 @@ def test_risk_limits_from_settings():
     assert limits.max_position_usd == 100.0
     assert limits.max_order_usd == 25.0
     assert limits.max_portfolio_exposure_usd == 300.0
+
+
+def test_risk_limits_from_settings_override_swaps_in_the_live_fund_cap():
+    # main.py passes settings.live_max_fund_usd here for live trading, so
+    # the real-money cap and the paper-trading cap can never bleed into
+    # each other even though they share one Settings object.
+    settings = _FakeSettings(max_position_usd=100.0, max_order_usd=25.0, max_portfolio_exposure_usd=300.0)
+    limits = RiskLimits.from_settings(settings, portfolio_exposure_usd_override=50.0)
+    assert limits.max_portfolio_exposure_usd == 50.0
 
 
 def test_approves_a_request_within_all_limits():
