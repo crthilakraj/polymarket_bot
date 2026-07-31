@@ -1,17 +1,18 @@
 import pytest
-from py_clob_client.exceptions import PolyApiException
+from py_clob_client_v2.exceptions import PolyApiException
 
 from execution.models import OrderIntent
-from execution.orders import OrderPlacementError, cancel_order, place_order
+from execution.orders import GeoRestrictedError, OrderPlacementError, cancel_order, place_order
 from signals.base import Side
 
 
 class _FakeHttpResponse:
-    def __init__(self, status_code):
+    def __init__(self, status_code, body=None):
         self.status_code = status_code
+        self._body = body if body is not None else {"error": "boom"}
 
     def json(self):
-        return {"error": "boom"}
+        return self._body
 
     @property
     def text(self):
@@ -57,8 +58,8 @@ class FakeClobClient:
             raise result
         return result
 
-    def cancel(self, order_id):
-        return {"canceled": order_id}
+    def cancel_order(self, payload):
+        return {"canceled": payload.orderID}
 
 
 def test_place_order_succeeds_on_first_try(monkeypatch):
@@ -148,3 +149,35 @@ def test_place_order_raises_on_exchange_level_rejection(monkeypatch):
 def test_cancel_order_delegates_to_client():
     client = FakeClobClient([])
     assert cancel_order(client, "order-123") == {"canceled": "order-123"}
+
+
+GEOBLOCK_BODY = {
+    "error": "Trading restricted in your region, please refer to available "
+    "regions - https://docs.polymarket.com/developers/CLOB/geoblock"
+}
+
+
+def test_place_order_raises_geo_restricted_error_on_region_block(monkeypatch):
+    monkeypatch.setattr("execution.orders.time.sleep", lambda _: None)
+    client = FakeClobClient([PolyApiException(resp=_FakeHttpResponse(403, GEOBLOCK_BODY))])
+
+    with pytest.raises(GeoRestrictedError):
+        place_order(client, make_intent())
+
+    assert client.post_order_calls == 1  # not retried - this will fail every time
+
+
+def test_geo_restricted_error_is_a_subclass_of_order_placement_error():
+    # So existing `except OrderPlacementError` call sites still catch it,
+    # even ones that don't know about the more specific geoblock case.
+    assert issubclass(GeoRestrictedError, OrderPlacementError)
+
+
+def test_place_order_does_not_treat_ordinary_403_as_geo_restricted(monkeypatch):
+    monkeypatch.setattr("execution.orders.time.sleep", lambda _: None)
+    client = FakeClobClient([PolyApiException(resp=_FakeHttpResponse(403, {"error": "bad request"}))])
+
+    with pytest.raises(OrderPlacementError) as exc_info:
+        place_order(client, make_intent())
+
+    assert not isinstance(exc_info.value, GeoRestrictedError)

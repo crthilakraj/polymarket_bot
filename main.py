@@ -56,7 +56,7 @@ def build_strategies() -> dict[str, SignalStrategy | MarketMakingStrategy]:
     replay time out and need bounding. Not worth the operational cost without
     a demonstrated edge."""
     strategies: dict[str, SignalStrategy | MarketMakingStrategy] = {
-        "complementary_outcomes": ComplementaryOutcomesSignal(),
+        "complementary_outcomes": ComplementaryOutcomesSignal(min_edge_bps=settings.min_edge_bps),
     }
     if settings.enable_market_making:
         strategies["market_making"] = MarketMakingStrategy(
@@ -73,16 +73,52 @@ def build_order_manager() -> OrderManager:
     clamps that cap to the real, live USDC balance queried from Polymarket
     on every risk check (see OrderManager._effective_risk_limits) - so a
     live order can never be sized against funds the wallet doesn't actually
-    have, only against a static .env number."""
+    have, only against a static .env number.
+
+    Also refuses to start live trading if either of two independent
+    restriction checks trips, both found live 2026-07-31 after this box (AWS
+    eu-west-2 / London, UK - on Polymarket's close-only list) got blocked
+    mid-session on a live canary test:
+      1. check_geoblock() - Polymarket's public, unauthenticated, real-time
+         IP-based check. This is the one that actually matters: it directly
+         answers "will Polymarket's edge reject orders from this box right
+         now", with no order attempt needed.
+      2. client.get_closed_only_mode() - an account-level compliance-ban
+         flag. Kept as a secondary check since it covers a different failure
+         mode (account sanctioned regardless of IP), but on its own it is
+         NOT sufficient - it returned closed_only=False for this exact
+         account the whole time real orders were being rejected by check #1.
+    Even with both, a geoblock could in principle start applying mid-session
+    (this check only runs at startup) - see execution.orders.GeoRestrictedError
+    and OrderManager._geo_restricted for the runtime circuit breaker that
+    catches that case (stops after the first live rejection instead of
+    repeating the same doomed request, as happened live before this existed:
+    72 failed orders before a human noticed)."""
     settings.require_live_trading_confirmation()
 
     client = None
     live_balance_fn = None
     bankroll_cap = settings.max_portfolio_exposure_usd
     if not settings.dry_run:
-        from execution.client import get_client, get_collateral_balance_usd
+        from execution.client import check_geoblock, get_client, get_collateral_balance_usd
+
+        geoblock_status = check_geoblock()
+        if geoblock_status.get("blocked"):
+            raise SystemExit(
+                f"Polymarket is blocking trading from this network location "
+                f"(ip={geoblock_status.get('ip')}, country={geoblock_status.get('country')}, "
+                f"region={geoblock_status.get('region')}). Refusing to start live trading. "
+                "See https://docs.polymarket.com/developers/CLOB/geoblock"
+            )
 
         client = get_client()
+        ban_status = client.get_closed_only_mode()
+        if isinstance(ban_status, dict) and ban_status.get("closed_only"):
+            raise SystemExit(
+                "Polymarket reports this account is in closed-only mode (compliance ban) - "
+                "new positions cannot be opened. Refusing to start live trading. "
+                "See https://docs.polymarket.com/developers/CLOB/geoblock"
+            )
         live_balance_fn = lambda: get_collateral_balance_usd(client)  # noqa: E731
         bankroll_cap = settings.live_max_fund_usd
         logger.warning("LIVE TRADING IS ENABLED - real orders will be placed on Polymarket")

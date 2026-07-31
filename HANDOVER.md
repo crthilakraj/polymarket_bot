@@ -238,6 +238,136 @@ Fixed:
   22 new/updated tests across `tests/execution/test_risk.py`,
   `test_order_manager.py`, `test_client.py`, `tests/test_config.py`.
 
+## First live canary test, and the py-clob-client v1->v2 migration (2026-07-31)
+
+**First-ever live attempt** (13:44-14:02 UTC, `LIVE_MAX_FUND_USD=30`,
+`MAX_ORDER_USD=10`, `MAX_POSITION_USD=15`, `MIN_EDGE_BPS=100`): before
+flipping live, ran `get_collateral_balance_usd()` against the real wallet for
+the first time ever and found `CLOB_SIGNATURE_TYPE=0` (EOA) was wrong - the
+account actually uses signature type 2 (Polymarket browser proxy wallet).
+Testing all three signature types found the real $260.46 balance (matching
+polymarket.com) only under type 2. Fixed in `.env`. Real bug, would have
+broken live order signing entirely if not caught first.
+
+**Then, once live**: every single order failed with `PolyApiException[400]:
+"invalid order version, please use the latest clob-client"` - 72 FAILED
+orders, 0 successful, $0 lost (orders rejected before any funds moved,
+caught by the 10-minute anomaly-monitoring cron and reverted automatically).
+Root cause: Polymarket migrated the CLOB to V2 on 2026-04-28 (new order
+struct, EIP-712 exchange domain version 1->2) and archived the original
+`py-clob-client` package on 2026-05-11. Every v1-signed order is rejected -
+this affects the *entire* installed base of the old client, not just this
+project. See https://docs.polymarket.com/v2-migration and
+https://github.com/Polymarket/py-clob-client/issues/337.
+
+**Fixed**: migrated `execution/client.py`, `execution/orders.py`,
+`scripts/generate_api_creds.py` (+ their tests) from `py-clob-client` to
+`py-clob-client-v2`. Verified against the installed package's actual source
+(not just the migration docs, which had some inaccuracies - e.g. claimed the
+`ClobClient` constructor became dict-based; it didn't, still positional args)
+before writing any code:
+- `ClobClient.__init__`, `OrderArgs`, `get_balance_allowance`,
+  `BalanceAllowanceParams`, `AssetType`, `create_order`/`post_order` are all
+  backward-compatible - only the import path changes.
+- `client.cancel(order_id)` (v1) -> `client.cancel_order(OrderPayload(orderID=order_id))`
+  (v2) - a real breaking change, only usage was `execution/orders.py`'s
+  `cancel_order()` wrapper (not called anywhere live yet).
+- `client.create_or_derive_api_creds()` (v1) -> `client.create_or_derive_api_key()`
+  (v2), used only by the one-time `scripts/generate_api_creds.py` setup script.
+- Confirmed post-V2 collateral is **pUSD, not USDC.e** (a separate change in
+  the same migration - API-only traders may need to `wrap()` USDC.e into pUSD
+  via the Collateral Onramp contract first) - pUSD is also 6 decimals so the
+  `/1_000_000` conversion in `get_collateral_balance_usd()` is unchanged. A
+  fresh balance check against the v2 client showed the same $260.46 with no
+  wrapping needed - this wallet's collateral was already usable.
+- Considered migrating to `Polymarket/py-sdk` (a newer unified REST+WebSocket
+  SDK the py-clob-client-v2 README recommends for new projects) instead, but
+  it's pre-1.0, explicitly warns of breaking changes between minor versions,
+  and isn't a drop-in replacement (different architecture entirely - would
+  mean also rewriting `data/gamma_client.py`/`data/ws_client.py`). Deferred as
+  a separate, deliberate future decision - out of scope for fixing what broke
+  the canary test. `py-clob-client-v2` itself is not archived/deprecated,
+  only "recommended against for new projects" in favor of the unified SDK.
+- All 301 tests pass. `pyproject.toml`/`uv.lock` updated (`py-clob-client`
+  removed, `py-clob-client-v2==1.1.0` added).
+
+**Not yet verified**: actual order *placement* end-to-end with the new
+client - the balance check is read-only. A second, smaller/shorter live
+canary test is the next step to confirm the fix actually works before
+trusting it for anything longer.
+
+## Second live canary test: v1->v2 fix confirmed, then a NEW hard blocker found (2026-07-31)
+
+Ran the second, tighter canary test (14:27 UTC, same conservative params:
+`LIVE_MAX_FUND_USD=30`, `MAX_ORDER_USD=10`, `MAX_POSITION_USD=15`,
+`MIN_EDGE_BPS=100`), monitored every 5 min. First ~50 minutes: 0 orders
+either way (real markets don't guarantee a qualifying signal on any
+schedule - not a problem). Then 2 orders failed with a **completely
+different** error than the first canary test:
+```
+PolyApiException[status_code=403]: "Trading restricted in your region,
+please refer to available regions - https://docs.polymarket.com/developers/CLOB/geoblock"
+```
+This confirms **the py-clob-client-v2 migration itself worked** - this error
+happens at a different, later layer than the order-version check (the exact
+thing that migration fixed). $0 lost, balance unchanged at $260.46, reverted
+immediately per the monitoring job's instructions.
+
+**Root cause: this box's public IP geolocates to London, UK** (AWS
+`eu-west-2`). Confirmed via `curl -s https://ipinfo.io/json` (`"city":
+"London", "country": "GB"`), then confirmed against Polymarket's own
+[geoblock docs](https://docs.polymarket.com/developers/CLOB/geoblock): the
+**United Kingdom is on the "Close-Only" restricted list** - new positions
+blocked on the frontend AND the API, for every account connecting from a UK
+IP, regardless of credentials or account status. This is structural and
+permanent for this server's location, not intermittent - every single live
+order from this box will be rejected until either the box moves to a
+non-restricted region or the restriction changes on Polymarket's end.
+
+**Investigated whether this could be checked via API before starting live
+trading** (user request). Two account-level checks both give false
+negatives for this exact failure mode:
+- `client.get_balance_allowance()` - shows the real balance ($260.46),
+  irrelevant to region.
+- `client.get_closed_only_mode()` (`GET /auth/ban-status/closed-only`) -
+  returned `{"closed_only": False}` the entire time real orders were being
+  rejected by the region block. This reflects an account-level compliance
+  flag, not the live per-request IP check.
+
+**Found the actual right check** (user pointed to it):
+`https://polymarket.com/api/geoblock` - a public, **unauthenticated**,
+real-time endpoint that directly answers the live IP-based question:
+`{"blocked": true, "ip": "...", "country": "GB", "region": "ENG"}` for this
+box, confirmed correct against curl and against the Python wrapper alike.
+
+**Fixed, in two layers**:
+1. `execution/client.py`'s new `check_geoblock()` calls this endpoint.
+   `main.py`'s `build_order_manager()` now calls it (plus, secondarily,
+   `get_closed_only_mode()` for the account-ban case it *does* cover)
+   before ever starting live trading, and refuses to start
+   (`SystemExit`) if blocked. This is the primary defense - it would have
+   caught this exact incident before a single live order was attempted.
+2. `execution/orders.py`'s new `GeoRestrictedError` (subclass of
+   `OrderPlacementError`) is raised specifically for the 403
+   "restricted in your region"/"geoblock" error signature.
+   `OrderManager` now has a circuit breaker (`_geo_restricted` flag,
+   `geo_restricted` property): the first time this error is seen, all
+   further live order attempts short-circuit immediately (no network call)
+   instead of repeating the same doomed request. This is the second layer,
+   for the case the startup check can't cover: a block starting mid-session.
+   Directly motivated by the FIRST canary test's incident (72 identical
+   failed orders before a human noticed) - this makes that pattern
+   impossible to repeat, for any error class that gets mapped to
+   `GeoRestrictedError` in the future.
+3. 11 new tests across `tests/execution/test_orders.py`,
+   `test_order_manager.py`, `test_client.py`, `tests/test_main.py`.
+   312 total tests pass.
+
+**Current status**: live trading is blocked from this specific server,
+structurally, until the hosting location changes. Not something further
+code changes can fix - see the "Honest open questions" section below for
+what to actually do about it.
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet, and does settlement work? Yes to both, confirmed 2026-07-29.** 63 of 311 tracked markets had resolved (Gamma-client fix above). `checkpoint_and_prune.py` never called `Portfolio.settle()` though - a resolved position just sat open forever at its pre-resolution avg_cost. Fixed: it now cross-references held condition_ids against `market_metadata.closed` and settles via `outcome_prices`. First live run after the fix settled **28 positions across 14 resolved markets in one pass**: cash $2493.99 -> $3893.24, realized_pnl $85.66 -> $140.69, open positions 34 -> 8 legs. This is the strongest validation yet - the core thesis (buy a $1 guaranteed payout for less than $1) held at actual settlement, not just round-trip price action. Remaining open question: keep watching over a longer window to see this repeat, rather than trusting one large batch.
@@ -246,6 +376,7 @@ Fixed:
 4. **Still dry-run only.** Do not flip `DRY_RUN`/`LIVE_TRADING_CONFIRMED` without the user explicitly asking — see `config.Settings.require_live_trading_confirmation()`.
 5. If asked "should we go live with real money": not yet — wait for at least one realized market resolution to confirm the settlement path works as modeled, and a full day-night cycle of the new checkpoint-tracked data.
 6. **Before testing any new destructive/DB-modifying script against the live database, copy it first**: `cp polymarket_data.db polymarket_data.db.bak`. This was not done before testing `checkpoint_and_prune.py` and caused the incident described above.
+7. **Live trading is structurally blocked from this server (UK/AWS eu-west-2) - unresolved, not a code problem.** Confirmed via `execution.client.check_geoblock()` (which is now checked automatically before any live start). Options, not yet decided: (a) move the whole deployment to a non-restricted region - the clean fix, but a real migration; (b) route through a VPN/proxy in an allowed region - flagged as risky beyond the technical question, likely violates Polymarket's ToS regardless of feasibility, could get the account banned; (c) leave live trading off entirely and treat this as a paper-trading-only validation project. Do not attempt (b) without the user explicitly weighing that risk first.
 
 ## Safety notes
 

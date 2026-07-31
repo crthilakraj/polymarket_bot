@@ -70,6 +70,7 @@ class Settings:
     # not a guarantee that much is actually available.
     live_max_fund_usd: float
     kelly_fraction: float
+    min_edge_bps: float
 
     # Data layer
     market_condition_ids: list[str]
@@ -110,6 +111,7 @@ class Settings:
             max_portfolio_exposure_usd=float(os.getenv("MAX_PORTFOLIO_EXPOSURE_USD", "300")),
             live_max_fund_usd=float(os.getenv("LIVE_MAX_FUND_USD", "300")),
             kelly_fraction=float(os.getenv("KELLY_FRACTION", "0.25")),
+            min_edge_bps=float(os.getenv("MIN_EDGE_BPS", "50")),
             market_condition_ids=_load_tracked_market_ids(
                 os.getenv("TRACKED_MARKETS_PATH", "tracked_markets.json"),
                 _parse_id_list(os.getenv("MARKET_CONDITION_IDS")),

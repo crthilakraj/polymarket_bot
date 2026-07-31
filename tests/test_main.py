@@ -79,6 +79,64 @@ def test_build_order_manager_raises_without_explicit_live_confirmation(monkeypat
         main_module.build_order_manager()
 
 
+def test_build_order_manager_refuses_to_start_live_when_geoblocked(monkeypatch):
+    import execution.client as client_module
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        dataclasses.replace(real_settings, dry_run=False, live_trading_confirmed=True),
+    )
+    monkeypatch.setattr(
+        client_module,
+        "check_geoblock",
+        lambda: {"blocked": True, "ip": "1.2.3.4", "country": "GB", "region": "ENG"},
+    )
+
+    with pytest.raises(SystemExit, match="blocking trading"):
+        main_module.build_order_manager()
+
+
+def test_build_order_manager_refuses_to_start_live_when_account_closed_only(monkeypatch):
+    import execution.client as client_module
+
+    class _FakeClient:
+        def get_closed_only_mode(self):
+            return {"closed_only": True}
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        dataclasses.replace(real_settings, dry_run=False, live_trading_confirmed=True),
+    )
+    monkeypatch.setattr(client_module, "check_geoblock", lambda: {"blocked": False})
+    monkeypatch.setattr(client_module, "get_client", lambda: _FakeClient())
+
+    with pytest.raises(SystemExit, match="closed-only"):
+        main_module.build_order_manager()
+
+
+def test_build_order_manager_proceeds_live_when_both_checks_pass(monkeypatch):
+    import execution.client as client_module
+
+    class _FakeClient:
+        def get_closed_only_mode(self):
+            return {"closed_only": False}
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        dataclasses.replace(real_settings, dry_run=False, live_trading_confirmed=True),
+    )
+    monkeypatch.setattr(client_module, "check_geoblock", lambda: {"blocked": False})
+    monkeypatch.setattr(client_module, "get_client", lambda: _FakeClient())
+    monkeypatch.setattr(client_module, "get_collateral_balance_usd", lambda client: 100.0)
+
+    order_manager = main_module.build_order_manager()
+
+    assert isinstance(order_manager, OrderManager)
+
+
 def test_run_signal_strategy_records_activity_and_a_decision_per_leg(tmp_path):
     journal = DecisionJournal(tmp_path / "journal.db")
     order_manager = OrderManager(

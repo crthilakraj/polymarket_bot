@@ -93,3 +93,41 @@ def test_get_collateral_balance_usd_raises_on_unexpected_response_shape():
 
     with pytest.raises(RuntimeError):
         client_module.get_collateral_balance_usd(fake_client)
+
+
+class _FakeHttpxResponse:
+    def __init__(self, json_data, status_code=200):
+        self._json_data = json_data
+        self.status_code = status_code
+
+    def json(self):
+        return self._json_data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def test_check_geoblock_returns_the_parsed_response(monkeypatch):
+    captured = {}
+
+    def fake_get(url, timeout=None):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return _FakeHttpxResponse({"blocked": True, "ip": "1.2.3.4", "country": "GB", "region": "ENG"})
+
+    monkeypatch.setattr(client_module.httpx, "get", fake_get)
+
+    result = client_module.check_geoblock()
+
+    assert result == {"blocked": True, "ip": "1.2.3.4", "country": "GB", "region": "ENG"}
+    assert captured["url"] == client_module.GEOBLOCK_URL
+
+
+def test_check_geoblock_raises_on_http_error(monkeypatch):
+    monkeypatch.setattr(
+        client_module.httpx, "get", lambda url, timeout=None: _FakeHttpxResponse({}, status_code=500)
+    )
+
+    with pytest.raises(RuntimeError):
+        client_module.check_geoblock()

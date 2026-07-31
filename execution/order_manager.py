@@ -96,6 +96,7 @@ class OrderManager:
         self._market_exposure_usd: dict[str, float] = {}
         self._total_exposure_usd = 0.0
         self._recent_intents: dict[str, float] = {}
+        self._geo_restricted = False
 
     # ---- exposure bookkeeping ---------------------------------------------------
 
@@ -105,6 +106,12 @@ class OrderManager:
     @property
     def total_exposure(self) -> float:
         return self._total_exposure_usd
+
+    @property
+    def geo_restricted(self) -> bool:
+        """True once a GeoRestrictedError has been seen this session - see
+        _submit()'s circuit breaker."""
+        return self._geo_restricted
 
     def _record_exposure(self, condition_id: str, notional_usd: float) -> None:
         self._market_exposure_usd[condition_id] = self.market_exposure(condition_id) + notional_usd
@@ -430,8 +437,37 @@ class OrderManager:
         if self._client is None:
             raise RuntimeError("OrderManager has no client configured and dry_run is False")
 
+        if self._geo_restricted:
+            # Once we've seen one geoblock rejection, every subsequent order
+            # from this network location is doomed too (see
+            # orders.GeoRestrictedError) - short-circuit instead of repeating
+            # the same doomed network request. Found live 2026-07-31: without
+            # this, the bot burned through 72 identical failed orders before
+            # a human noticed.
+            return OrderDecision(
+                status=OrderStatus.FAILED,
+                intent=intent,
+                reasons=[
+                    "trading blocked for this network location (geoblock) - "
+                    "not retrying further live orders this session"
+                ],
+            )
+
         try:
             response = orders_module.place_order(self._client, intent)
+        except orders_module.GeoRestrictedError:
+            self._geo_restricted = True
+            logger.critical(
+                "order rejected as geo-restricted for %s - Polymarket is blocking trading "
+                "from this network location (see https://docs.polymarket.com/developers/CLOB/geoblock). "
+                "No further live orders will be attempted this session.",
+                idempotency_key,
+            )
+            return OrderDecision(
+                status=OrderStatus.FAILED,
+                intent=intent,
+                reasons=["order rejected: trading restricted for this network location (geoblock)"],
+            )
         except orders_module.OrderPlacementError:
             logger.exception("order placement failed for %s", idempotency_key)
             return OrderDecision(

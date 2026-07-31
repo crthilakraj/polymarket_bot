@@ -366,6 +366,53 @@ def test_live_mode_without_client_raises():
         manager.handle_signal(make_signal(), make_market(), make_book())
 
 
+# --- geoblock circuit breaker -------------------------------------------------------
+
+
+def test_geo_restricted_error_sets_flag_and_reports_failed(monkeypatch):
+    def fake_place_order(client, intent):
+        raise orders_module.GeoRestrictedError("blocked")
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(dry_run=False, client=object())
+    assert manager.geo_restricted is False
+
+    decision = manager.handle_signal(make_signal(), make_market(), make_book())
+
+    assert decision.status is OrderStatus.FAILED
+    assert manager.geo_restricted is True
+
+
+def test_geo_restricted_short_circuits_further_orders_without_calling_place_order(monkeypatch):
+    calls = []
+
+    def fake_place_order(client, intent):
+        calls.append(intent)
+        raise orders_module.GeoRestrictedError("blocked")
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(dry_run=False, client=object())
+
+    manager.handle_signal(make_signal(), make_market("0xcond-a"), make_book())
+    second = manager.handle_signal(make_signal(), make_market("0xcond-b"), make_book())
+
+    assert len(calls) == 1  # second order never actually hit place_order()
+    assert second.status is OrderStatus.FAILED
+    assert "geoblock" in second.reasons[0]
+
+
+def test_ordinary_placement_error_does_not_trip_the_geo_circuit_breaker(monkeypatch):
+    def fake_place_order(client, intent):
+        raise orders_module.OrderPlacementError("some other failure")
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(dry_run=False, client=object())
+
+    manager.handle_signal(make_signal(), make_market(), make_book())
+
+    assert manager.geo_restricted is False
+
+
 # --- live-funds awareness ----------------------------------------------------------
 
 

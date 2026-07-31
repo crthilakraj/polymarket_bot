@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from py_clob_client.client import ClobClient
+from py_clob_client_v2.client import ClobClient
 
 from config import settings
 from execution.client import POLYGON_CHAIN_ID
@@ -40,7 +40,7 @@ def main() -> None:
         signature_type=settings.clob_signature_type,
         funder=settings.clob_funder_address,
     )
-    creds = client.create_or_derive_api_creds()
+    creds = client.create_or_derive_api_key()
     if creds is None:
         raise SystemExit("Failed to create or derive API credentials - check the logs above.")
 
