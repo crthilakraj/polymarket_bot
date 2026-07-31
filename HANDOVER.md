@@ -368,6 +368,57 @@ structurally, until the hosting location changes. Not something further
 code changes can fix - see the "Honest open questions" section below for
 what to actually do about it.
 
+## Database corruption, found while prepping a snapshot for the eu-west-1 move (2026-07-31)
+
+Plan was to snapshot this Lightsail instance as-is and relaunch it in
+eu-west-1 (Ireland) - unlike the UK, Ireland's close-only restriction is
+frontend-only per Polymarket's docs, so the API should be unaffected there
+(confirm with `check_geoblock()` from the new instance before trusting this).
+Before snapshotting, stopped all 3 services and ran `PRAGMA
+wal_checkpoint(TRUNCATE)` to avoid shipping a bloated WAL - the WAL had grown
+to **35GB** (worse than the earlier disk-full incident), and disk dropped
+from 82% to 28% used once truncated.
+
+**Found real, pre-existing database corruption** while checking on this
+(unrelated to anything done this session): `PRAGMA integrity_check` reported
+18 issues - a genuine B-tree structural problem (`Rowid ... out of order`,
+duplicate page references) plus NULL/type corruption and index mismatches in
+`market_metadata` and `order_book_snapshots`. Root cause, from
+`journalctl`: `polymarket-bot-checkpoint.service` hit `database disk image is
+malformed` at 18:06 UTC, then got **OOM-killed** at 19:51 after 1h44m of CPU
+time seemingly stuck retrying against the already-corrupt file - the OOM
+likely interrupted a write mid-flight and caused (or worsened) the
+corruption in the first place.
+
+**decisions_log and activity_log showed zero corruption** - the actual
+trade-history evidence for the live-viability question was untouched.
+Everything corrupted was disposable: `market_metadata` is a pure Gamma-API
+cache, `order_book_snapshots` is raw tick data already superseded by the
+checkpoint. Confirmed with the user this data wasn't worth a complex
+recovery effort before proceeding.
+
+**Fix**: `DROP TABLE order_book_snapshots` succeeded, but `DROP TABLE
+market_metadata` itself failed with the same malformed-image error - the
+corruption was bad enough to block DDL on that table, not just reads of
+specific rows. Worked around it instead of fighting the corrupted file
+further: built a fresh `polymarket_data.db` with the identical schema
+(captured from `sqlite_master` first), copied `decisions_log` (2,786 rows)
+and `activity_log` (1,819 rows) over via `ATTACH DATABASE ... old`, left
+`market_metadata`/`order_book_snapshots` empty, verified `PRAGMA
+integrity_check` reports `ok` on the new file, then swapped it into place.
+The corrupted original is kept at `polymarket_data.db.corrupted` (also a
+redundant full backup at `polymarket_data.db.pre-corruption-fix.bak` - safe
+to delete one of these, they're identical, ~7.9GB each) in case anything
+needs forensics later. Checkpoint replay against the new DB matched exactly
+(`cash=$2257.31 realized_pnl=$545.63 open_positions=36`) - no data loss on
+anything that mattered.
+
+**Not yet done**: the actual snapshot-and-move to eu-west-1 - this
+corruption discovery interrupted that plan. `market_metadata` will
+repopulate automatically as the bot runs; consider waiting for it to refill
+a reasonable amount before taking the snapshot, or take it now and let the
+new instance repopulate it there instead.
+
 ## Honest open questions / what to check next
 
 1. **Has anything resolved yet, and does settlement work? Yes to both, confirmed 2026-07-29.** 63 of 311 tracked markets had resolved (Gamma-client fix above). `checkpoint_and_prune.py` never called `Portfolio.settle()` though - a resolved position just sat open forever at its pre-resolution avg_cost. Fixed: it now cross-references held condition_ids against `market_metadata.closed` and settles via `outcome_prices`. First live run after the fix settled **28 positions across 14 resolved markets in one pass**: cash $2493.99 -> $3893.24, realized_pnl $85.66 -> $140.69, open positions 34 -> 8 legs. This is the strongest validation yet - the core thesis (buy a $1 guaranteed payout for less than $1) held at actual settlement, not just round-trip price action. Remaining open question: keep watching over a longer window to see this repeat, rather than trusting one large batch.

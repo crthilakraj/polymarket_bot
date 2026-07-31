@@ -21,7 +21,9 @@ htmlcov/
 *.db
 *.db-shm
 *.db-wal
+*.db.*
 *.sqlite3
+*.bak
 tracked_markets.json
 arb_checkpoint.json
 
