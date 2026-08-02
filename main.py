@@ -104,11 +104,25 @@ def build_order_manager() -> OrderManager:
 
         geoblock_status = check_geoblock()
         if geoblock_status.get("blocked"):
-            raise SystemExit(
-                f"Polymarket is blocking trading from this network location "
-                f"(ip={geoblock_status.get('ip')}, country={geoblock_status.get('country')}, "
-                f"region={geoblock_status.get('region')}). Refusing to start live trading. "
-                "See https://docs.polymarket.com/developers/CLOB/geoblock"
+            if not settings.override_geoblock_check:
+                raise SystemExit(
+                    f"Polymarket is blocking trading from this network location "
+                    f"(ip={geoblock_status.get('ip')}, country={geoblock_status.get('country')}, "
+                    f"region={geoblock_status.get('region')}). Refusing to start live trading. "
+                    "Set OVERRIDE_GEOBLOCK_CHECK=true in .env to proceed anyway (only do this "
+                    "if you've confirmed via a real order that this account/IP combination can "
+                    "actually trade despite this endpoint's report - see canary test 2026-08-02: "
+                    "an eu-west-1/Ireland account placed and filled a real order here while this "
+                    "check reported blocked=true). "
+                    "See https://docs.polymarket.com/developers/CLOB/geoblock"
+                )
+            logger.warning(
+                "check_geoblock() reports blocked=true (ip=%s, country=%s, region=%s) but "
+                "OVERRIDE_GEOBLOCK_CHECK=true - proceeding anyway. The runtime GeoRestrictedError "
+                "circuit breaker in OrderManager is still active as a second layer.",
+                geoblock_status.get("ip"),
+                geoblock_status.get("country"),
+                geoblock_status.get("region"),
             )
 
         client = get_client()

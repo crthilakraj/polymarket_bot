@@ -36,11 +36,15 @@ currently decrease when an order is later cancelled - that's a documented
 gap, not an oversight (see README).
 """
 
+import concurrent.futures
 import dataclasses
 import hashlib
 import logging
+import threading
 import time
 from collections.abc import Callable, Iterable
+
+from py_clob_client_v2.clob_types import OrderType
 
 from data.models import MarketMetadata, OrderBook
 from execution import orders as orders_module
@@ -97,6 +101,12 @@ class OrderManager:
         self._total_exposure_usd = 0.0
         self._recent_intents: dict[str, float] = {}
         self._geo_restricted = False
+        # Multi-leg baskets submit their legs concurrently (see
+        # handle_multi_leg_signal) so their _submit() calls can land on this
+        # bookkeeping at the same time - `self._total_exposure_usd += x` is
+        # a read-modify-write, not atomic, so two legs finishing in the same
+        # instant could silently lose one leg's contribution without a lock.
+        self._bookkeeping_lock = threading.Lock()
 
     # ---- exposure bookkeeping ---------------------------------------------------
 
@@ -114,8 +124,11 @@ class OrderManager:
         return self._geo_restricted
 
     def _record_exposure(self, condition_id: str, notional_usd: float) -> None:
-        self._market_exposure_usd[condition_id] = self.market_exposure(condition_id) + notional_usd
-        self._total_exposure_usd += notional_usd
+        with self._bookkeeping_lock:
+            self._market_exposure_usd[condition_id] = (
+                self.market_exposure(condition_id) + notional_usd
+            )
+            self._total_exposure_usd += notional_usd
 
     # ---- live-funds awareness -----------------------------------------------------
 
@@ -301,19 +314,204 @@ class OrderManager:
                 for _ in legs
             ]
 
-        return [
-            self._submit(
-                condition_id=condition_id,
-                token_id=leg["token_id"],
-                side=leg["side"],
-                price=leg["price"],
-                size=num_complete_sets,
-                strategy="signal_multi_leg",
-                reasons=result.reasons,
-                fee_rate=fee_rate,
+        # Legs are submitted concurrently rather than one-after-another: the
+        # single biggest driver of the mismatched-leg problem this file's
+        # flatten/reconcile machinery exists to clean up isn't random - it's
+        # the market having time to move in the gap between sequential HTTP
+        # round-trips (each leg's place_order() call is ~100s of ms). Firing
+        # every leg's request at once shrinks that gap to roughly one
+        # request's latency instead of N requests' latency, which is the
+        # actual lever on how often a basket ends up needing a flatten at
+        # all - not just how gracefully it recovers when it does.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(legs)) as executor:
+            decisions = list(
+                executor.map(
+                    lambda leg: self._submit(
+                        condition_id=condition_id,
+                        token_id=leg["token_id"],
+                        side=leg["side"],
+                        price=leg["price"],
+                        size=num_complete_sets,
+                        strategy="signal_multi_leg",
+                        reasons=result.reasons,
+                        fee_rate=fee_rate,
+                        order_type=OrderType.FOK,
+                    ),
+                    legs,
+                )
             )
-            for leg in legs
-        ]
+        self._reconcile_multi_leg_fills(decisions, condition_id=condition_id)
+        return decisions
+
+    _FILL_POLL_ATTEMPTS = 5
+    _FILL_POLL_DELAY_SECONDS = 0.4
+
+    def _poll_order_fill(self, order_id: str) -> float | None:
+        """Query get_order() a few times with a short delay instead of
+        trusting a single immediate read. Found live 2026-08-02: a FOK leg
+        matched in full, but _reconcile_multi_leg_fills() (a single,
+        immediate get_order() call) read it as size_matched=0 because
+        Polymarket's match hadn't been indexed yet on the exchange's side
+        (this account's very first order also showed an async 'delayed'
+        status right after submission before settling) - so no mismatch was
+        detected and the fill sat unhedged until a human noticed. Exact
+        intermediate status strings aren't documented, so rather than
+        pattern-match on one, this just polls a bounded number of times and
+        returns as soon as a nonzero fill shows up (the common case,
+        resolves in well under a second) or after exhausting attempts
+        (~2s total) if it never does - which then correctly means unfilled,
+        not unchecked."""
+        last_size_matched = 0.0
+        for attempt in range(1, self._FILL_POLL_ATTEMPTS + 1):
+            try:
+                order = self._client.get_order(order_id)
+            except Exception:
+                logger.exception(
+                    "failed to check fill status for order %s while reconciling a multi-leg "
+                    "basket - cannot verify whether this leg needs flattening",
+                    order_id,
+                )
+                return None
+            last_size_matched = (
+                float(order.get("size_matched", 0.0)) if isinstance(order, dict) else 0.0
+            )
+            if last_size_matched > 0 or attempt == self._FILL_POLL_ATTEMPTS:
+                return last_size_matched
+            time.sleep(self._FILL_POLL_DELAY_SECONDS)
+        return last_size_matched
+
+    def _reconcile_multi_leg_fills(
+        self, decisions: list[OrderDecision], *, condition_id: str | None
+    ) -> None:
+        """FOK legs either fill in full immediately or are killed - unlike
+        the GTC bug found live 2026-08-02 (one leg filled, its sibling
+        rested unmatched for 15+ minutes while the market moved from 0.61 to
+        0.99, leaving a naked single-leg position instead of the intended
+        complete-set arb). Legs are still separate API calls though, so one
+        can fill while a sibling's FOK cancels (thin liquidity, or price
+        moved between legs). Check actual matched size per leg right after
+        submission and flatten any leg that ended up ahead of the others,
+        instead of holding an unhedged position until someone notices."""
+        if self._dry_run or self._client is None:
+            return
+
+        fills: list[tuple[OrderDecision, float]] = []
+        for decision in decisions:
+            if decision.status is not OrderStatus.SUBMITTED or decision.order_id is None:
+                fills.append((decision, 0.0))
+                continue
+            size_matched = self._poll_order_fill(decision.order_id)
+            if size_matched is None:
+                continue
+            fills.append((decision, size_matched))
+
+        if len(fills) < 2:
+            return
+        min_matched = min(size for _, size in fills)
+        epsilon = 1e-6
+        for decision, size_matched in fills:
+            excess = size_matched - min_matched
+            if excess <= epsilon:
+                continue
+            logger.critical(
+                "multi-leg basket left an unhedged leg: token=%s matched %.4f shares while a "
+                "sibling leg only matched %.4f - flattening the excess %.4f shares instead of "
+                "holding naked exposure.",
+                decision.intent.token_id,
+                size_matched,
+                min_matched,
+                excess,
+            )
+            flatten_side = Side.SELL if decision.intent.side is Side.BUY else Side.BUY
+            flatten_price = 0.01 if flatten_side is Side.SELL else 0.99
+            # Polymarket rejects order amounts finer than 2 decimals ("invalid
+            # amounts...max accuracy of 2 decimals") - found live 2026-08-02
+            # when `excess` carried float noise past that precision and the
+            # flatten was rejected outright, every retry, on a completely
+            # different error than the settlement-lag one this retry loop was
+            # built for.
+            rounded_excess = round(excess, self._FLATTEN_SIZE_DECIMALS)
+            if rounded_excess <= 0:
+                continue
+            flatten_intent = dataclasses.replace(
+                decision.intent,
+                side=flatten_side,
+                price=flatten_price,
+                size=rounded_excess,
+                idempotency_key=f"{decision.intent.idempotency_key}-flatten",
+            )
+            self._flatten_until_clear(flatten_intent, condition_id=condition_id)
+
+    _FLATTEN_SIZE_DECIMALS = 2
+    _FLATTEN_ROUNDS = 5
+
+    def _flatten_until_clear(
+        self, flatten_intent: OrderIntent, *, condition_id: str | None
+    ) -> None:
+        """A FAK flatten order that places successfully can still only
+        partially fill (same as any FAK order) - found live 2026-08-02: one
+        flatten call returned no error at all, but the position afterward
+        still showed a large partial naked balance, because the earlier
+        version treated 'place_order() didn't raise' as 'fully flattened'
+        without ever checking how much of it actually matched. This retries
+        against the real remaining shortfall - not just on exceptions -
+        until it's cleared or rounds are exhausted."""
+        remaining = flatten_intent.size
+        for round_num in range(1, self._FLATTEN_ROUNDS + 1):
+            attempt_size = round(remaining, self._FLATTEN_SIZE_DECIMALS)
+            if attempt_size <= 0:
+                return
+            attempt_intent = dataclasses.replace(flatten_intent, size=attempt_size)
+            order_id = self._place_flatten_order_with_retry(
+                attempt_intent, condition_id=condition_id
+            )
+            matched = self._poll_order_fill(order_id) if order_id else None
+            remaining -= matched or 0.0
+            if round(remaining, self._FLATTEN_SIZE_DECIMALS) <= 0:
+                return
+            if round_num < self._FLATTEN_ROUNDS:
+                time.sleep(self._FILL_POLL_DELAY_SECONDS)
+        logger.critical(
+            "FAILED to fully flatten unhedged leg for token=%s - %.4f shares still naked "
+            "after %d rounds of retries. MANUAL INTERVENTION REQUIRED.",
+            flatten_intent.token_id,
+            remaining,
+            self._FLATTEN_ROUNDS,
+        )
+
+    def _place_flatten_order_with_retry(
+        self, flatten_intent: OrderIntent, *, condition_id: str | None
+    ) -> str | None:
+        """Selling shares immediately after buying them can hit the same
+        settlement lag as the fill-detection race _reconcile_multi_leg_fills
+        exists to fix: Polymarket's balance ledger doesn't always reflect a
+        just-matched BUY instantly, so an immediate flatten SELL can fail
+        with 'balance: 0' even though the shares are definitely there.
+        Retries placement itself with a short delay; returns the resulting
+        order_id (for the caller to verify the actual fill), or None if
+        every attempt raised."""
+        last_exc: orders_module.OrderPlacementError | None = None
+        for attempt in range(1, self._FILL_POLL_ATTEMPTS + 1):
+            try:
+                response = orders_module.place_order(
+                    self._client, flatten_intent, order_type=OrderType.FAK
+                )
+                if condition_id:
+                    self._record_exposure(
+                        condition_id, -(flatten_intent.price * flatten_intent.size)
+                    )
+                return response.get("orderID") if isinstance(response, dict) else None
+            except orders_module.OrderPlacementError as exc:
+                last_exc = exc
+                if attempt < self._FILL_POLL_ATTEMPTS:
+                    time.sleep(self._FILL_POLL_DELAY_SECONDS)
+        logger.warning(
+            "flatten order placement failed for token=%s after %d attempts: %s",
+            flatten_intent.token_id,
+            self._FILL_POLL_ATTEMPTS,
+            last_exc,
+        )
+        return None
 
     # ---- quote-driven path (market making) ---------------------------------------
 
@@ -384,6 +582,7 @@ class OrderManager:
         strategy: str,
         reasons: Iterable[str] = (),
         fee_rate: float = 0.0,
+        order_type: OrderType = OrderType.GTC,
     ) -> OrderDecision:
         """Idempotency check, then submit (or log, in dry-run mode) and book
         exposure. Assumes sizing/risk-approval already happened - callers are
@@ -454,7 +653,7 @@ class OrderManager:
             )
 
         try:
-            response = orders_module.place_order(self._client, intent)
+            response = orders_module.place_order(self._client, intent, order_type=order_type)
         except orders_module.GeoRestrictedError:
             self._geo_restricted = True
             logger.critical(

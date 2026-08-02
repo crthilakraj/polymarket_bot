@@ -89,6 +89,7 @@ class Settings:
     dry_run: bool
     live_trading_confirmed: bool
     enable_market_making: bool
+    override_geoblock_check: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -130,6 +131,8 @@ class Settings:
             live_trading_confirmed=os.getenv("LIVE_TRADING_CONFIRMED", "false").lower()
             in ("1", "true", "yes"),
             enable_market_making=os.getenv("ENABLE_MARKET_MAKING", "false").lower()
+            in ("1", "true", "yes"),
+            override_geoblock_check=os.getenv("OVERRIDE_GEOBLOCK_CHECK", "false").lower()
             in ("1", "true", "yes"),
         )
 

@@ -85,7 +85,12 @@ def test_build_order_manager_refuses_to_start_live_when_geoblocked(monkeypatch):
     monkeypatch.setattr(
         main_module,
         "settings",
-        dataclasses.replace(real_settings, dry_run=False, live_trading_confirmed=True),
+        dataclasses.replace(
+            real_settings,
+            dry_run=False,
+            live_trading_confirmed=True,
+            override_geoblock_check=False,
+        ),
     )
     monkeypatch.setattr(
         client_module,
@@ -95,6 +100,36 @@ def test_build_order_manager_refuses_to_start_live_when_geoblocked(monkeypatch):
 
     with pytest.raises(SystemExit, match="blocking trading"):
         main_module.build_order_manager()
+
+
+def test_build_order_manager_proceeds_live_when_geoblocked_but_overridden(monkeypatch):
+    import execution.client as client_module
+
+    class _FakeClient:
+        def get_closed_only_mode(self):
+            return {"closed_only": False}
+
+    monkeypatch.setattr(
+        main_module,
+        "settings",
+        dataclasses.replace(
+            real_settings,
+            dry_run=False,
+            live_trading_confirmed=True,
+            override_geoblock_check=True,
+        ),
+    )
+    monkeypatch.setattr(
+        client_module,
+        "check_geoblock",
+        lambda: {"blocked": True, "ip": "1.2.3.4", "country": "GB", "region": "ENG"},
+    )
+    monkeypatch.setattr(client_module, "get_client", lambda: _FakeClient())
+    monkeypatch.setattr(client_module, "get_collateral_balance_usd", lambda client: 100.0)
+
+    order_manager = main_module.build_order_manager()
+
+    assert isinstance(order_manager, OrderManager)
 
 
 def test_build_order_manager_refuses_to_start_live_when_account_closed_only(monkeypatch):
@@ -107,7 +142,12 @@ def test_build_order_manager_refuses_to_start_live_when_account_closed_only(monk
     monkeypatch.setattr(
         main_module,
         "settings",
-        dataclasses.replace(real_settings, dry_run=False, live_trading_confirmed=True),
+        dataclasses.replace(
+            real_settings,
+            dry_run=False,
+            live_trading_confirmed=True,
+            override_geoblock_check=False,
+        ),
     )
     monkeypatch.setattr(client_module, "check_geoblock", lambda: {"blocked": False})
     monkeypatch.setattr(client_module, "get_client", lambda: _FakeClient())
@@ -126,7 +166,12 @@ def test_build_order_manager_proceeds_live_when_both_checks_pass(monkeypatch):
     monkeypatch.setattr(
         main_module,
         "settings",
-        dataclasses.replace(real_settings, dry_run=False, live_trading_confirmed=True),
+        dataclasses.replace(
+            real_settings,
+            dry_run=False,
+            live_trading_confirmed=True,
+            override_geoblock_check=False,
+        ),
     )
     monkeypatch.setattr(client_module, "check_geoblock", lambda: {"blocked": False})
     monkeypatch.setattr(client_module, "get_client", lambda: _FakeClient())

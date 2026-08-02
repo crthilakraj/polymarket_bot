@@ -1,4 +1,5 @@
 import pytest
+from py_clob_client_v2.clob_types import OrderType
 
 from data.models import MarketMetadata, OrderBook, PriceLevel
 from execution import orders as orders_module
@@ -176,6 +177,31 @@ def test_handle_multi_leg_signal_submits_one_decision_per_leg_at_equal_share_cou
     assert sizes["t2"] == pytest.approx(100.0)
 
 
+def test_record_exposure_is_thread_safe_under_concurrent_leg_submission():
+    """handle_multi_leg_signal now submits a basket's legs concurrently (to
+    shrink the race window between them, the actual driver of mismatched
+    fills) - _record_exposure()'s `self._total_exposure_usd += x` is a
+    read-modify-write, not atomic, so without a lock two legs finishing at
+    the same instant could silently lose one leg's contribution. Hammer it
+    from many threads and check nothing gets dropped."""
+    import concurrent.futures
+
+    manager = make_manager()
+    notional_per_call = 1.0
+    call_count = 500
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        list(
+            executor.map(
+                lambda _: manager._record_exposure("0xcond", notional_per_call),
+                range(call_count),
+            )
+        )
+
+    assert manager.total_exposure == pytest.approx(notional_per_call * call_count)
+    assert manager.market_exposure("0xcond") == pytest.approx(notional_per_call * call_count)
+
+
 def test_handle_multi_leg_signal_resizes_to_available_room_keeping_legs_equal():
     manager = make_manager(
         risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=9.3, max_portfolio_exposure_usd=1000.0)
@@ -234,6 +260,187 @@ def test_handle_multi_leg_signal_rejects_whole_basket_if_any_leg_is_a_duplicate(
     assert len(second) == 2
     assert all(d.status is OrderStatus.REJECTED for d in second)
     assert all("duplicate" in d.reasons[0] for d in second)
+
+
+def test_handle_multi_leg_signal_flattens_a_leg_that_filled_while_its_sibling_did_not(monkeypatch):
+    """FOK legs are separate API calls, so one can fill while a sibling's FOK
+    cancels unmatched (thin liquidity, price moved between legs). Found live
+    2026-08-02 with the old GTC behavior: a sibling leg rested unfilled for
+    15+ minutes while the market moved substantially, leaving a naked,
+    uncompensated single-leg position instead of the intended complete-set
+    arb. Reconciliation should detect the mismatch right after submission
+    and flatten the filled leg back to zero instead of holding it."""
+    calls = []
+
+    def fake_place_order(client, intent, order_type=None):
+        calls.append((intent, order_type))
+        order_id = "order-flatten" if intent.idempotency_key.endswith("-flatten") else f"order-{intent.token_id}"
+        return {"success": True, "orderID": order_id}
+
+    class FakeClient:
+        def get_order(self, order_id):
+            return {"size_matched": "100.0" if order_id in ("order-t1", "order-flatten") else "0.0"}
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=93.0, max_portfolio_exposure_usd=1000.0),
+        dry_run=False,
+        client=FakeClient(),
+    )
+    signal = make_multi_leg_signal()
+
+    decisions = manager.handle_multi_leg_signal(signal, make_market())
+
+    assert len(decisions) == 2
+    flatten_calls = [c for c in calls if c[0].idempotency_key.endswith("-flatten")]
+    assert len(flatten_calls) == 1
+    flatten_intent, flatten_order_type = flatten_calls[0]
+    assert flatten_intent.token_id == "t1"
+    assert flatten_intent.side is Side.SELL
+    assert flatten_intent.size == pytest.approx(100.0)
+    assert flatten_order_type is OrderType.FAK
+
+
+def test_flatten_retries_through_a_transient_settlement_lag_error(monkeypatch):
+    """Found live 2026-08-02: selling shares immediately after buying them
+    can fail with 'balance: 0' because Polymarket's ledger hasn't caught up
+    to the just-matched BUY yet, even though the shares are really there.
+    The flatten attempt should retry instead of giving up after one failure
+    and leaving the position naked."""
+    monkeypatch.setattr("execution.order_manager.time.sleep", lambda _seconds: None)
+    calls = []
+    attempts_before_success = 2
+
+    def fake_place_order(client, intent, order_type=None):
+        calls.append(intent)
+        if intent.idempotency_key.endswith("-flatten") and len(
+            [c for c in calls if c.idempotency_key == intent.idempotency_key]
+        ) <= attempts_before_success:
+            raise orders_module.OrderPlacementError("balance: 0 (settlement lag)")
+        order_id = "order-flatten" if intent.idempotency_key.endswith("-flatten") else f"order-{intent.token_id}"
+        return {"success": True, "orderID": order_id}
+
+    class FakeClient:
+        def get_order(self, order_id):
+            return {"size_matched": "100.0" if order_id in ("order-t1", "order-flatten") else "0.0"}
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=93.0, max_portfolio_exposure_usd=1000.0),
+        dry_run=False,
+        client=FakeClient(),
+    )
+    signal = make_multi_leg_signal()
+
+    manager.handle_multi_leg_signal(signal, make_market())
+
+    flatten_attempts = [c for c in calls if c.idempotency_key.endswith("-flatten")]
+    assert len(flatten_attempts) == attempts_before_success + 1  # 2 failures then a success
+
+
+def test_flatten_gives_up_and_logs_critical_after_exhausting_retries(monkeypatch, caplog):
+    monkeypatch.setattr("execution.order_manager.time.sleep", lambda _seconds: None)
+
+    def fake_place_order(client, intent, order_type=None):
+        if intent.idempotency_key.endswith("-flatten"):
+            raise orders_module.OrderPlacementError("balance: 0 (still stuck)")
+        order_id = f"order-{intent.token_id}"
+        return {"success": True, "orderID": order_id}
+
+    class FakeClient:
+        def get_order(self, order_id):
+            return {"size_matched": "100.0" if order_id == "order-t1" else "0.0"}
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=93.0, max_portfolio_exposure_usd=1000.0),
+        dry_run=False,
+        client=FakeClient(),
+    )
+    signal = make_multi_leg_signal()
+
+    with caplog.at_level("CRITICAL"):
+        manager.handle_multi_leg_signal(signal, make_market())
+
+    assert any("MANUAL INTERVENTION REQUIRED" in r.message for r in caplog.records)
+
+
+def test_flatten_rounds_excess_to_two_decimals(monkeypatch):
+    """Polymarket rejects order amounts finer than 2 decimals ('invalid
+    amounts...max accuracy of 2 decimals'). Found live 2026-08-02: float
+    noise in the computed excess (e.g. 1.95000000001) got rejected outright
+    on every retry attempt, a completely different failure than the
+    settlement-lag race the retry loop was built for."""
+    calls = []
+
+    def fake_place_order(client, intent, order_type=None):
+        calls.append(intent)
+        order_id = "order-flatten" if intent.idempotency_key.endswith("-flatten") else f"order-{intent.token_id}"
+        return {"success": True, "orderID": order_id}
+
+    class FakeClient:
+        def get_order(self, order_id):
+            # t1 matched with float noise past 2 decimals - t2 matched 0.
+            if order_id == "order-t1":
+                return {"size_matched": "33.33333333333"}
+            if order_id == "order-flatten":
+                return {"size_matched": "33.33"}
+            return {"size_matched": "0.0"}
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=93.0, max_portfolio_exposure_usd=1000.0),
+        dry_run=False,
+        client=FakeClient(),
+    )
+    signal = make_multi_leg_signal()
+
+    manager.handle_multi_leg_signal(signal, make_market())
+
+    flatten_calls = [c for c in calls if c.idempotency_key.endswith("-flatten")]
+    assert len(flatten_calls) == 1
+    assert flatten_calls[0].size == round(flatten_calls[0].size, 2)
+
+
+def test_flatten_retries_against_the_real_remaining_shortfall_on_a_partial_fill(monkeypatch):
+    """A flatten FAK order can itself only partially fill, same as any FAK
+    order. Found live 2026-08-02: place_order() not raising was treated as
+    'fully flattened' without checking how much of it actually matched,
+    silently leaving a large partial naked balance. The retry should target
+    the real remaining shortfall, not just retry on exceptions."""
+    monkeypatch.setattr("execution.order_manager.time.sleep", lambda _seconds: None)
+    flatten_calls = []
+
+    def fake_place_order(client, intent, order_type=None):
+        if intent.idempotency_key.endswith("-flatten"):
+            flatten_calls.append(intent)
+            order_id = f"order-flatten-{len(flatten_calls)}"
+            return {"success": True, "orderID": order_id}
+        return {"success": True, "orderID": f"order-{intent.token_id}"}
+
+    class FakeClient:
+        def get_order(self, order_id):
+            if order_id == "order-t1":
+                return {"size_matched": "100.0"}
+            if order_id == "order-flatten-1":
+                return {"size_matched": "60.0"}  # only 60 of 100 filled
+            if order_id == "order-flatten-2":
+                return {"size_matched": "40.0"}  # the remaining 40 clears it
+            return {"size_matched": "0.0"}
+
+    monkeypatch.setattr(orders_module, "place_order", fake_place_order)
+    manager = make_manager(
+        risk_limits=RiskLimits(max_position_usd=1000.0, max_order_usd=93.0, max_portfolio_exposure_usd=1000.0),
+        dry_run=False,
+        client=FakeClient(),
+    )
+    signal = make_multi_leg_signal()
+
+    manager.handle_multi_leg_signal(signal, make_market())
+
+    assert len(flatten_calls) == 2
+    assert flatten_calls[0].size == pytest.approx(100.0)
+    assert flatten_calls[1].size == pytest.approx(40.0)  # retried against the real shortfall
 
 
 def test_multi_leg_and_single_leg_orders_share_the_same_exposure_tracker():
@@ -331,7 +538,7 @@ def test_resubmission_allowed_after_idempotency_ttl_expires():
 def test_live_submission_calls_place_order_and_records_exposure(monkeypatch):
     calls = []
 
-    def fake_place_order(client, intent):
+    def fake_place_order(client, intent, order_type=None):
         calls.append(intent)
         return {"success": True, "orderID": "order-1"}
 
@@ -347,7 +554,7 @@ def test_live_submission_calls_place_order_and_records_exposure(monkeypatch):
 
 
 def test_live_submission_reports_failed_status_on_placement_error(monkeypatch):
-    def fake_place_order(client, intent):
+    def fake_place_order(client, intent, order_type=None):
         raise orders_module.OrderPlacementError("boom")
 
     monkeypatch.setattr(orders_module, "place_order", fake_place_order)
@@ -370,7 +577,7 @@ def test_live_mode_without_client_raises():
 
 
 def test_geo_restricted_error_sets_flag_and_reports_failed(monkeypatch):
-    def fake_place_order(client, intent):
+    def fake_place_order(client, intent, order_type=None):
         raise orders_module.GeoRestrictedError("blocked")
 
     monkeypatch.setattr(orders_module, "place_order", fake_place_order)
@@ -386,7 +593,7 @@ def test_geo_restricted_error_sets_flag_and_reports_failed(monkeypatch):
 def test_geo_restricted_short_circuits_further_orders_without_calling_place_order(monkeypatch):
     calls = []
 
-    def fake_place_order(client, intent):
+    def fake_place_order(client, intent, order_type=None):
         calls.append(intent)
         raise orders_module.GeoRestrictedError("blocked")
 
@@ -402,7 +609,7 @@ def test_geo_restricted_short_circuits_further_orders_without_calling_place_orde
 
 
 def test_ordinary_placement_error_does_not_trip_the_geo_circuit_breaker(monkeypatch):
-    def fake_place_order(client, intent):
+    def fake_place_order(client, intent, order_type=None):
         raise orders_module.OrderPlacementError("some other failure")
 
     monkeypatch.setattr(orders_module, "place_order", fake_place_order)

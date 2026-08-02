@@ -74,10 +74,20 @@ def _is_geo_restricted(exc: PolyApiException) -> bool:
     return "geoblock" in text.lower() or "restricted in your region" in text.lower()
 
 
-def place_order(client: ClobClient, intent: OrderIntent) -> dict:
+def place_order(
+    client: ClobClient, intent: OrderIntent, order_type: OrderType = OrderType.GTC
+) -> dict:
     """Sign intent once, then POST it with retry on transient failures.
     Raises OrderPlacementError on a non-retryable failure, an exchange-level
-    rejection, or if retries are exhausted."""
+    rejection, or if retries are exhausted.
+
+    order_type defaults to GTC (resting until filled or canceled) for the
+    single-leg path. Multi-leg baskets (OrderManager.handle_multi_leg_signal)
+    use FOK instead, so a leg either fills immediately in full or is killed -
+    never rests for an extended period. Found live 2026-08-02: a GTC leg
+    rested unmatched for 15+ minutes while its sibling leg filled
+    immediately, and the market moved substantially in between, turning a
+    supposed complete-set arb into a real, uncompensated single-leg loss."""
     order_args = OrderArgs(
         token_id=intent.token_id,
         price=intent.price,
@@ -90,7 +100,7 @@ def place_order(client: ClobClient, intent: OrderIntent) -> dict:
     last_exc: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = client.post_order(signed_order, OrderType.GTC)
+            response = client.post_order(signed_order, order_type)
         except PolyApiException as exc:
             last_exc = exc
             if _is_geo_restricted(exc):
